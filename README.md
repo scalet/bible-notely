@@ -49,9 +49,10 @@ A data da aula sai do caminho (`2026-01-04`), não do nome do arquivo. A busca s
 
 ## Requisitos
 
-- Python 3.14 em `/usr/bin/python3.14` (o Whisper precisa de wheel do `torch`).
+- Python 3.14 em `/usr/bin/python3.14` (o Whisper precisa de wheel do `torch`; o 3.15 do mise não instala).
+- Whisper (`openai-whisper` no `requirements.txt`), modelo `medium`, idioma `pt`. Na primeira transcrição o modelo é baixado (cerca de 770 MB).
+- `ffmpeg` e `ffprobe` no `PATH` — o Whisper usa para o áudio; a extração de frames também.
 - Node.js para instalar e buildar a interface.
-- `ffmpeg` e `ffprobe` no `PATH`.
 - Conta Google com a pasta das aulas e um cliente OAuth (aplicativo da Web).
 
 ## Subir o ambiente
@@ -125,7 +126,7 @@ PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli obsidian
 PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli cleanup
 ```
 
-Na primeira identificação o programa baixa os modelos de rosto para `data/models/` (cerca de 40 MB).
+Na primeira identificação o programa baixa os modelos de rosto para `data/models/` (cerca de 40 MB). O modelo do Whisper (`medium`) baixa na primeira transcrição.
 
 ## Notas do Obsidian
 
