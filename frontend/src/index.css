@@ -1,0 +1,48 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Segoe UI", "SF Pro Text", "Helvetica Neue", sans-serif;
+  --font-mono: "SF Mono", "Cascadia Code", Consolas, monospace;
+  --color-ink: #0c0c0c;
+  --color-panel: #141414;
+  --color-raised: #1c1c1c;
+  --color-hover: #262626;
+  --color-line: #2a2a2a;
+  --color-line-2: #333333;
+  --color-fg: #f2f2f2;
+  --color-muted: #8c8c8c;
+  --color-faint: #5c5c5c;
+  --color-accent: #f54e00;
+  --color-accent-2: #ff7a3d;
+  --color-ok: #2ea043;
+  --color-warn: #d29922;
+  --color-err: #f85149;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-ink);
+  color: var(--color-fg);
+  letter-spacing: -0.01em;
+}
+
+@keyframes dialog-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.dialog-in {
+  animation: dialog-in 180ms ease-out;
+}
