@@ -1,0 +1,8 @@
+[Unit]
+Description=bible-notely process next EBD video
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/scalet/Documents/DEV/auto-ebd
+Environment=PYTHONPATH=/home/scalet/Documents/DEV/auto-ebd
+ExecStart=/home/scalet/Documents/DEV/auto-ebd/.venv/bin/python -m backend.app.cli run --max 1

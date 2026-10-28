@@ -1,0 +1,15 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+pydantic-settings>=2.6.0
+sqlalchemy>=2.0.36
+httpx>=0.27.0
+python-dotenv>=1.0.1
+google-api-python-client>=2.150.0
+google-auth-oauthlib>=1.2.1
+google-auth-httplib2>=0.2.0
+openai-whisper>=20250625  # CPU: pip install --extra-index-url https://download.pytorch.org/whl/cpu
+reportlab>=4.2.5
+Pillow>=11.0.0
+opencv-python-headless>=4.10.0
+numpy>=1.26.0
