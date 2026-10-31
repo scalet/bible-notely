@@ -20,6 +20,8 @@ from backend.app.runtime import (
     get_ai_provider,
     get_drive_video_count,
     get_folder_id,
+    get_youtube_upload_folder_id,
+    get_youtube_upload_path,
     cancel_event,
     pause_event,
     pipeline_snapshot,
@@ -34,7 +36,10 @@ from backend.app.schemas import (
     SettingsOut,
     SpeakerIn,
     SpeakerOut,
+    YouTubeBrowseOut,
+    YouTubeFolderOut,
 )
+from backend.app.services import youtube as youtube_service
 from backend.app.services import drive
 from backend.app.services.llm import provider_flags
 from backend.app.services.pipeline import (
@@ -100,9 +105,9 @@ def health() -> dict:
     return {"ok": True}
 
 
-@router.get("/settings", response_model=SettingsOut)
-def get_settings() -> SettingsOut:
+def _settings_out(db: Session) -> SettingsOut:
     provider = get_ai_provider()
+    stats = youtube_service.youtube_scope_stats(db)
     return SettingsOut(
         google_connected=drive.is_connected(),
         google_account=drive.google_account(),
@@ -120,7 +125,18 @@ def get_settings() -> SettingsOut:
         whisper_model=settings.whisper_model,
         speakers_photo_dir=str(settings.speakers_fotos_dir),
         whisper_language=settings.whisper_language,
+        youtube_connected=youtube_service.youtube_connected(),
+        youtube_upload_folder_id=get_youtube_upload_folder_id(),
+        youtube_upload_path=get_youtube_upload_path(),
+        youtube_scope_eligible=stats["eligible"],
+        youtube_scope_pending=stats["pending_youtube"],
+        youtube_scope_uploaded=stats["on_youtube"],
     )
+
+
+@router.get("/settings", response_model=SettingsOut)
+def get_settings(db: Session = Depends(get_db)) -> SettingsOut:
+    return _settings_out(db)
 
 
 @router.put("/settings", response_model=SettingsOut)
@@ -133,9 +149,50 @@ def put_settings(body: SettingsIn, db: Session = Depends(get_db)) -> SettingsOut
         payload["ai_provider"] = body.ai_provider
     if body.google_drive_folder_id is not None:
         payload["google_drive_folder_id"] = body.google_drive_folder_id
+    if body.youtube_upload_folder_id is not None:
+        payload["youtube_upload_folder_id"] = body.youtube_upload_folder_id.strip()
+    if body.youtube_upload_path is not None:
+        payload["youtube_upload_path"] = body.youtube_upload_path.replace("\\", "/").strip("/")
     if payload:
         update_runtime(**payload)
-    return get_settings()
+    return _settings_out(db)
+
+
+@router.get("/youtube/browse", response_model=YouTubeBrowseOut)
+def youtube_browse(
+    parent_id: str | None = None,
+    parent_path: str = "",
+    db: Session = Depends(get_db),
+) -> YouTubeBrowseOut:
+    require_speakers(db)
+    root = get_folder_id()
+    if not root:
+        raise HTTPException(400, "Configure a pasta raiz do Drive em Ajustes")
+    if not drive.is_connected():
+        raise HTTPException(400, "Conecte o Google Drive em Ajustes")
+    current_parent = (parent_id or root).strip()
+    normalized_path = parent_path.replace("\\", "/").strip("/")
+    try:
+        raw = youtube_service.list_drive_subfolders(current_parent)
+    except drive.DriveError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    folders = [
+        YouTubeFolderOut(
+            id=item["id"],
+            name=item["name"],
+            path=youtube_service.join_drive_path(normalized_path, item["name"]),
+        )
+        for item in raw
+    ]
+    stats = youtube_service.youtube_scope_stats(db)
+    return YouTubeBrowseOut(
+        parent_id=current_parent,
+        parent_path=normalized_path,
+        selection_folder_id=get_youtube_upload_folder_id(),
+        selection_path=get_youtube_upload_path(),
+        stats=stats,
+        folders=folders,
+    )
 
 
 @router.get("/drive/auth")

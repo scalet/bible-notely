@@ -44,6 +44,14 @@ def get_folder_id() -> str:
     return _load().get("google_drive_folder_id") or settings.google_drive_folder_id
 
 
+def get_youtube_upload_folder_id() -> str:
+    return str(_load().get("youtube_upload_folder_id") or "")
+
+
+def get_youtube_upload_path() -> str:
+    return str(_load().get("youtube_upload_path") or "").replace("\\", "/").strip("/")
+
+
 def get_drive_video_count() -> int | None:
     raw = _load().get("drive_video_count")
     if raw is None or raw == "":

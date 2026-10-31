@@ -14,7 +14,14 @@ from sqlalchemy.orm import sessionmaker
 
 from backend.app.db import Base
 from backend.app.models import Lecture
-from backend.app.services.youtube import apply_upload_entry
+from backend.app.models import Speaker
+from backend.app.services.youtube import (
+    apply_upload_entry,
+    lecture_in_upload_scope,
+    load_local_state,
+    save_local_state,
+    upload_row_for_lecture,
+)
 
 
 class ClassifyTest(unittest.TestCase):
@@ -81,6 +88,61 @@ class ClassifyTest(unittest.TestCase):
         )
         self.assertTrue(yt.already_uploaded(state, "file1"))
         self.assertEqual(state["uploads"]["file1"]["youtube_url"], "https://www.youtube.com/watch?v=vid123")
+
+
+class ScopeTest(unittest.TestCase):
+    def test_scope_prefix(self) -> None:
+        from unittest import mock
+
+        lecture = Lecture(drive_path="2025/09-Setembro/21-09")
+        with mock.patch("backend.app.services.youtube.get_youtube_upload_path", return_value="2025/09-Setembro"):
+            self.assertTrue(lecture_in_upload_scope(lecture))
+        with mock.patch("backend.app.services.youtube.get_youtube_upload_path", return_value="2026/01-Janeiro"):
+            self.assertFalse(lecture_in_upload_scope(lecture))
+        with mock.patch("backend.app.services.youtube.get_youtube_upload_path", return_value=""):
+            self.assertTrue(lecture_in_upload_scope(lecture))
+
+
+class UploadRowTest(unittest.TestCase):
+    def test_row_from_lecture(self) -> None:
+        lecture = Lecture(
+            drive_file_id="x",
+            drive_path="2026/01-Janeiro/04-01",
+            video_filename="20260104_090354.mp4",
+            lecture_date=date(2026, 1, 4),
+        )
+        speaker = Speaker(name="Gerson")
+        summary = {"titulo": "Tema da aula"}
+        row = upload_row_for_lecture(lecture, speaker, summary)
+        self.assertIn("IBQB - EBD", row["youtube_title"])
+        self.assertIn("Tema da aula", row["youtube_title"])
+        self.assertEqual(row["skip_reason"], "")
+
+
+class LocalStateTest(unittest.TestCase):
+    def test_save_and_load_local_state(self) -> None:
+        from backend.app.config import settings
+
+        path = settings.youtube_state_path
+        backup = path.read_text(encoding="utf-8") if path.exists() else None
+        try:
+            state = yt.empty_state()
+            yt.record_upload(
+                state,
+                drive_file_id="f1",
+                youtube_id="v1",
+                title="t",
+                drive_path="p",
+                playlist=yt.PLAYLIST_EBD,
+            )
+            save_local_state(state)
+            loaded = load_local_state()
+            self.assertEqual(loaded["uploads"]["f1"]["youtube_id"], "v1")
+        finally:
+            if backup is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(backup, encoding="utf-8")
 
 
 class SyncSqliteTest(unittest.TestCase):

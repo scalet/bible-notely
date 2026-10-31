@@ -51,6 +51,27 @@ export type Settings = {
   whisper_model: string;
   whisper_language: string;
   speakers_photo_dir?: string;
+  youtube_connected?: boolean;
+  youtube_upload_folder_id?: string;
+  youtube_upload_path?: string;
+  youtube_scope_eligible?: number;
+  youtube_scope_pending?: number;
+  youtube_scope_uploaded?: number;
+};
+
+export type YouTubeFolder = {
+  id: string;
+  name: string;
+  path: string;
+};
+
+export type YouTubeBrowse = {
+  parent_id: string;
+  parent_path: string;
+  selection_folder_id: string;
+  selection_path: string;
+  stats: { eligible: number; pending_youtube: number; on_youtube: number };
+  folders: YouTubeFolder[];
 };
 
 export type Pipeline = {
@@ -86,12 +107,24 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   settings: () => req<Settings>("/api/settings"),
-  saveSettings: (body: { ai_provider?: string; google_drive_folder_id?: string }) =>
+  saveSettings: (body: {
+    ai_provider?: string;
+    google_drive_folder_id?: string;
+    youtube_upload_folder_id?: string;
+    youtube_upload_path?: string;
+  }) =>
     req<Settings>("/api/settings", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
+  youtubeBrowse: (parentId?: string, parentPath?: string) => {
+    const params = new URLSearchParams();
+    if (parentId) params.set("parent_id", parentId);
+    if (parentPath) params.set("parent_path", parentPath);
+    const q = params.toString();
+    return req<YouTubeBrowse>(`/api/youtube/browse${q ? `?${q}` : ""}`);
+  },
   driveAuth: (origin: string) =>
     req<{ url: string }>(`/api/drive/auth?origin=${encodeURIComponent(origin)}`),
   speakers: () => req<Speaker[]>("/api/speakers"),
