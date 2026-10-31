@@ -48,6 +48,10 @@ class LectureOut(BaseModel):
     transcribed: bool
     summarized: bool
     uploaded: bool
+    youtube_id: str = ""
+    youtube_url: str = ""
+    youtube_title: str = ""
+    youtube_uploaded_at: datetime | None = None
     status: str
     error: str
     updated_at: datetime
@@ -68,11 +72,34 @@ class SettingsOut(BaseModel):
     whisper_model: str
     whisper_language: str
     speakers_photo_dir: str = ""
+    youtube_connected: bool = False
+    youtube_upload_folder_id: str = ""
+    youtube_upload_path: str = ""
+    youtube_scope_eligible: int = 0
+    youtube_scope_pending: int = 0
+    youtube_scope_uploaded: int = 0
 
 
 class SettingsIn(BaseModel):
     ai_provider: str | None = None
     google_drive_folder_id: str | None = None
+    youtube_upload_folder_id: str | None = None
+    youtube_upload_path: str | None = None
+
+
+class YouTubeFolderOut(BaseModel):
+    id: str
+    name: str
+    path: str
+
+
+class YouTubeBrowseOut(BaseModel):
+    parent_id: str
+    parent_path: str
+    selection_folder_id: str = ""
+    selection_path: str = ""
+    stats: dict[str, int]
+    folders: list[YouTubeFolderOut]
 
 
 class PipelineStatus(BaseModel):

@@ -124,6 +124,9 @@ PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli run --max 1
 PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli speakers
 PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli obsidian
 PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli cleanup
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-auth
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-upload --max 1
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-sync
 ```
 
 Na primeira identificação o programa baixa os modelos de rosto para `data/models/` (cerca de 40 MB). O modelo do Whisper (`medium`) baixa na primeira transcrição.
@@ -131,6 +134,44 @@ Na primeira identificação o programa baixa os modelos de rosto para `data/mode
 ## Notas do Obsidian
 
 Cada resumo gera `data/obsidian/AAAA-MM-DD - {video}.md`. Para gravar direto no vault, defina `OBSIDIAN_DIR` no `.env`. A nota tem frontmatter, links `[[João 3.16]]` e o texto ARC das passagens. `cli obsidian` regenera todas a partir do banco.
+
+## YouTube v2
+
+Envio dos MP4s da pasta EBD no Drive para o YouTube **não listado**, com título `IBQB - EBD|Culto - DD/MM/AAAA - {título do estudo}` e descrição montada a partir do resumo gerado aqui. O vínculo pasta ↔ URL fica no SQLite (`lectures.youtube_url`), visível na tela **Aulas**.
+
+### Local (nesta máquina)
+
+1. Processe/resuma as aulas (`cli run`).
+2. Em **Ajustes → YouTube**, navegue nas pastas do Drive e clique em **usar esta pasta** (só aulas resumidas dentro desse diretório entram no upload). Deixe vazio = raiz inteira.
+3. Conecte o YouTube (token separado do Drive, em `data/youtube/token.json`):
+
+```bash
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-auth
+```
+
+4. Envie vídeos (baixa do Drive, sobe ao YouTube, grava SQLite e `data/youtube/state.json`):
+
+```bash
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-upload --max 1
+```
+
+Cerca de **6 uploads/dia** por cota padrão da YouTube Data API. MP4s grandes passam pelo disco local (`work/youtube/`).
+
+5. Se precisar reaplicar URLs do state sem reenviar:
+
+```bash
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-sync
+```
+
+(`youtube-sync` lê `data/youtube/state.json` e, se existir, o `state.json` do Colab na pasta `auto-ebd-youtube` no Drive.)
+
+### Colab (volumes muito grandes / rede Google)
+
+1. `cli youtube-catalog` — grava `auto-ebd-youtube/catalog.json` no Drive.
+2. [colab/upload_youtube.ipynb](colab/upload_youtube.ipynb) — upload no Colab.
+3. `cli youtube-sync` — importa URLs para o SQLite.
+
+Pré-requisitos: YouTube Data API v3 ativa, canal verificado para vídeos longos, mesmo `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` do Drive (escopos `youtube.upload` e `youtube` no login do `youtube-auth` ou no OAuth do Colab).
 
 ## Rotina diária
 
@@ -147,5 +188,5 @@ Ajuste `WorkingDirectory` e `ExecStart` no unit para o caminho deste clone. Log 
 ## Testes
 
 ```bash
-PYTHONPATH="$PWD" .venv/bin/python -m unittest tests.test_pipeline_rules tests.test_speakers tests.test_size_and_exclusion tests.test_prefetch tests.test_pdf tests.test_logging -q
+PYTHONPATH="$PWD" .venv/bin/python -m unittest tests.test_pipeline_rules tests.test_speakers tests.test_size_and_exclusion tests.test_prefetch tests.test_pdf tests.test_logging tests.test_youtube_classify -q
 ```

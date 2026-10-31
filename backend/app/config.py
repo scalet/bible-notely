@@ -71,6 +71,22 @@ class Settings(BaseSettings):
         return self.data_dir / "google_token.json"
 
     @property
+    def youtube_dir(self) -> Path:
+        return self.data_dir / "youtube"
+
+    @property
+    def youtube_token_path(self) -> Path:
+        return self.youtube_dir / "token.json"
+
+    @property
+    def youtube_state_path(self) -> Path:
+        return self.youtube_dir / "state.json"
+
+    @property
+    def youtube_work_dir(self) -> Path:
+        return self.work_dir / "youtube"
+
+    @property
     def prompt_path(self) -> Path:
         return ROOT / "prompts" / "resumo.txt"
 
@@ -83,6 +99,8 @@ class Settings(BaseSettings):
             self.speakers_fotos_dir,
             self.models_dir,
             self.frames_dir,
+            self.youtube_dir,
+            self.youtube_work_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
 

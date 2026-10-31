@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, type Settings } from "../api";
+import { api, type Settings, type YouTubeBrowse } from "../api";
 import { btn, btnPrimary, card, empty, input, label, listRow, mono, muted, pill, sidePanel } from "../ui";
 
 const PROVIDERS = [
@@ -11,6 +11,7 @@ const PROVIDERS = [
 
 const SECTIONS = [
   { id: "drive", label: "Google Drive", hint: "conexão e pasta raiz" },
+  { id: "youtube", label: "YouTube", hint: "pasta do Drive para enviar" },
   { id: "ai", label: "Provedor de IA", hint: "quem escreve o resumo" },
   { id: "local", label: "Ambiente", hint: "whisper, modelo e fotos" },
 ] as const;
@@ -142,6 +143,15 @@ export function SettingsPage({
             {note ? <p className="mt-3 rounded-lg bg-raised px-3 py-2 text-xs text-fg">{note}</p> : null}
           </div>
         </aside>
+      ) : section === "youtube" ? (
+        <YouTubeSection
+          settings={settings}
+          busy={busy}
+          note={note}
+          onClose={() => setSection(null)}
+          onSave={save}
+          onChange={onChange}
+        />
       ) : section === "ai" ? (
         <aside className={sidePanel}>
           <SectionHeader title="Provedor de IA" onClose={() => setSection(null)} />
@@ -202,6 +212,158 @@ export function SettingsPage({
         </aside>
       )}
     </div>
+  );
+}
+
+type BrowseFrame = { id: string; path: string; label: string };
+
+function YouTubeSection({
+  settings,
+  busy,
+  note,
+  onClose,
+  onSave,
+  onChange,
+}: {
+  settings: Settings;
+  busy: string;
+  note: string;
+  onClose: () => void;
+  onSave: (key: string, action: () => Promise<string>) => void;
+  onChange: () => Promise<void>;
+}) {
+  const [browse, setBrowse] = useState<YouTubeBrowse | null>(null);
+  const [stack, setStack] = useState<BrowseFrame[]>([]);
+  const [loadError, setLoadError] = useState("");
+
+  async function loadBrowse(frame?: BrowseFrame) {
+    setLoadError("");
+    try {
+      const data = await api.youtubeBrowse(frame?.id, frame?.path || undefined);
+      setBrowse(data);
+    } catch (err) {
+      setBrowse(null);
+      setLoadError(err instanceof Error ? err.message : "Falha ao listar pastas");
+    }
+  }
+
+  useEffect(() => {
+    if (!settings.google_connected) return;
+    const root: BrowseFrame = {
+      id: settings.google_drive_folder_id,
+      path: "",
+      label: "Raiz EBD",
+    };
+    setStack([root]);
+    void loadBrowse(root);
+  }, [settings.google_connected, settings.google_drive_folder_id]);
+
+  const current = stack[stack.length - 1];
+
+  return (
+    <aside className={sidePanel}>
+      <SectionHeader title="YouTube" onClose={onClose} />
+      <div className="min-h-0 flex-1 overflow-auto px-4 py-3">
+        <p className={`${muted} mt-0 text-xs`}>
+          Só entram no envio aulas resumidas dentro da pasta escolhida. Login do canal:{" "}
+          <span className={mono}>cli youtube-auth</span> · envio: <span className={mono}>cli youtube-upload</span>
+        </p>
+        <div className={`${pill(settings.youtube_connected ? "ok" : "")} my-2.5`}>
+          <span className="size-1.5 rounded-full bg-current" />
+          {settings.youtube_connected ? "YouTube conectado (token local)" : "YouTube ainda não autenticado"}
+        </div>
+        {!settings.google_connected ? (
+          <p className="text-xs text-warn">Conecte o Google Drive na seção Drive antes de escolher a pasta.</p>
+        ) : null}
+        <dl className="m-0 grid grid-cols-[120px_1fr] gap-x-3 gap-y-1.5 text-xs">
+          <dt className="text-faint">Seleção atual</dt>
+          <dd className="m-0 break-all text-fg">{settings.youtube_upload_path || "Toda a raiz EBD"}</dd>
+          <dt className="text-faint">Na fila</dt>
+          <dd className="m-0 text-fg">
+            {settings.youtube_scope_pending ?? 0} pendentes · {settings.youtube_scope_uploaded ?? 0} no YouTube ·{" "}
+            {settings.youtube_scope_eligible ?? 0} elegíveis
+          </dd>
+        </dl>
+        {current ? (
+          <div className="mt-3 rounded-lg border border-line bg-ink p-2">
+            <div className="mb-2 flex flex-wrap items-center gap-2">
+              <span className="text-xs text-muted">Navegando:</span>
+              <span className={`${mono} text-xs text-fg`}>{current.path || current.label}</span>
+              <button
+                className={btn}
+                disabled={stack.length <= 1 || Boolean(busy)}
+                onClick={() => {
+                  const next = stack.slice(0, -1);
+                  setStack(next);
+                  void loadBrowse(next[next.length - 1]);
+                }}
+              >
+                subir
+              </button>
+            </div>
+            {loadError ? <p className="text-xs text-warn">{loadError}</p> : null}
+            <ul className="m-0 max-h-48 list-none overflow-auto p-0">
+              {(browse?.folders || []).map((folder) => (
+                <li key={folder.id}>
+                  <button
+                    type="button"
+                    className={`${listRow(false)} w-full text-left`}
+                    disabled={Boolean(busy)}
+                    onClick={() => {
+                      const frame: BrowseFrame = { id: folder.id, path: folder.path, label: folder.name };
+                      setStack((items) => [...items, frame]);
+                      void loadBrowse(frame);
+                    }}
+                  >
+                    <span className="font-medium">{folder.name}</span>
+                    <span className="block text-xs text-muted">{folder.path}</span>
+                  </button>
+                </li>
+              ))}
+              {!loadError && browse && browse.folders.length === 0 ? (
+                <li className="px-2 py-3 text-xs text-muted">Sem subpastas aqui.</li>
+              ) : null}
+            </ul>
+          </div>
+        ) : null}
+        <div className="mt-3 flex flex-wrap gap-2">
+          <button
+            className={btnPrimary}
+            disabled={!settings.google_connected || !current || Boolean(busy)}
+            onClick={() =>
+              void onSave("youtube-scope", async () => {
+                await api.saveSettings({
+                  youtube_upload_folder_id: current?.id || "",
+                  youtube_upload_path: current?.path || "",
+                });
+                await onChange();
+                if (current) await loadBrowse(current);
+                return current?.path
+                  ? `Pasta para upload: ${current.path}`
+                  : "Upload usará toda a raiz EBD.";
+              })
+            }
+          >
+            {busy === "youtube-scope" ? "salvando…" : "usar esta pasta"}
+          </button>
+          <button
+            className={btn}
+            disabled={Boolean(busy) || (!settings.youtube_upload_path && !settings.youtube_upload_folder_id)}
+            onClick={() =>
+              void onSave("youtube-clear", async () => {
+                await api.saveSettings({ youtube_upload_folder_id: "", youtube_upload_path: "" });
+                await onChange();
+                if (current) await loadBrowse(current);
+                return "Filtro removido; vale toda a raiz.";
+              })
+            }
+          >
+            limpar seleção
+          </button>
+        </div>
+        {note ? <p className="mt-3 rounded-lg bg-raised px-3 py-2 text-xs text-fg">{note}</p> : null}
+      </div>
+    </aside>
   );
 }
 
