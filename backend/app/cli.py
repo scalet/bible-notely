@@ -43,7 +43,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="bible-notely pipeline")
     parser.add_argument(
         "command",
-        choices=["run", "status", "speakers", "obsidian", "cleanup"],
+        choices=["run", "status", "speakers", "obsidian", "cleanup", "youtube-catalog", "youtube-sync"],
         nargs="?",
         default="run",
     )
@@ -86,6 +86,26 @@ def main() -> None:
             )
             for error in result["errors"]:
                 print(f"  erro: {error}")
+            return
+        if args.command == "youtube-catalog":
+            from backend.app.services.youtube import YouTubeError, export_catalog
+
+            try:
+                count, folder_id = export_catalog(db)
+            except YouTubeError as exc:
+                print(f"erro: {exc}")
+                return
+            print(f"catalog.json enviado: itens={count} pasta_drive={folder_id}")
+            return
+        if args.command == "youtube-sync":
+            from backend.app.services.youtube import YouTubeError, sync_from_drive_state
+
+            try:
+                updated, missing, total = sync_from_drive_state(db)
+            except YouTubeError as exc:
+                print(f"erro: {exc}")
+                return
+            print(f"youtube-sync: atualizadas={updated} sem_aula={missing} entradas_state={total}")
             return
         processed = asyncio.run(run_batch(db, max_items=args.max))
         print(f"processados={processed}")

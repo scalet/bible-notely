@@ -337,7 +337,23 @@ function LecturePanel({
           <Check on={lecture.transcribed} label="transcrita" />
           <Check on={lecture.summarized} label="resumo" />
           <Check on={lecture.uploaded} label="no Drive" />
+          <Check on={Boolean(lecture.youtube_url)} label="no YouTube" />
         </div>
+
+        {lecture.youtube_url ? (
+          <p className="mt-3 text-xs">
+            <span className="text-faint">YouTube: </span>
+            <a
+              href={lecture.youtube_url}
+              target="_blank"
+              rel="noreferrer"
+              className="break-all text-accent-2 underline-offset-2 hover:underline"
+              title={lecture.youtube_title || lecture.youtube_url}
+            >
+              {lecture.youtube_title || lecture.youtube_url}
+            </a>
+          </p>
+        ) : null}
 
         {locked ? (
           <p className="mt-3 rounded-lg border border-accent/30 bg-accent/10 px-3 py-2 text-xs text-accent-2">

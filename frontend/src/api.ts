@@ -31,6 +31,10 @@ export type Lecture = {
   transcribed: boolean;
   summarized: boolean;
   uploaded: boolean;
+  youtube_id?: string;
+  youtube_url?: string;
+  youtube_title?: string;
+  youtube_uploaded_at?: string | null;
   status: string;
   error: string;
   updated_at: string;

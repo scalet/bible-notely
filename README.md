@@ -132,6 +132,30 @@ Na primeira identificação o programa baixa os modelos de rosto para `data/mode
 
 Cada resumo gera `data/obsidian/AAAA-MM-DD - {video}.md`. Para gravar direto no vault, defina `OBSIDIAN_DIR` no `.env`. A nota tem frontmatter, links `[[João 3.16]]` e o texto ARC das passagens. `cli obsidian` regenera todas a partir do banco.
 
+## YouTube v2 (Google Colab)
+
+Envio dos MP4s da pasta EBD no Drive para o YouTube **não listado**, com título `IBQB - EBD|Culto - DD/MM/AAAA - {título do estudo}` e descrição montada a partir do resumo gerado aqui. O vínculo pasta ↔ URL fica no SQLite (`lectures.youtube_url`), visível na tela **Aulas**.
+
+Fluxo:
+
+1. Processe/resuma as aulas com o pipeline normal (`cli run`).
+2. Exporte metadados para o Drive:
+
+```bash
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-catalog
+```
+
+Isso grava `auto-ebd-youtube/catalog.json` dentro da pasta raiz configurada no Drive.
+
+3. Abra [colab/upload_youtube.ipynb](colab/upload_youtube.ipynb) no Google Colab, monte o Drive, configure OAuth (YouTube Data API v3 + Drive) e rode o upload (cerca de **6 vídeos/dia** por cota padrão da API).
+4. Traga as URLs para o banco local:
+
+```bash
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-sync
+```
+
+Pré-requisitos no Google Cloud / YouTube: canal verificado para vídeos longos, cliente OAuth Desktop em `auto-ebd-youtube/client_secret.json`, escopos `drive.readonly`, `youtube.upload` e `youtube`.
+
 ## Rotina diária
 
 `deploy/bible-notely.timer` dispara o serviço às 02:00, um vídeo por execução:
@@ -147,5 +171,5 @@ Ajuste `WorkingDirectory` e `ExecStart` no unit para o caminho deste clone. Log 
 ## Testes
 
 ```bash
-PYTHONPATH="$PWD" .venv/bin/python -m unittest tests.test_pipeline_rules tests.test_speakers tests.test_size_and_exclusion tests.test_prefetch tests.test_pdf tests.test_logging -q
+PYTHONPATH="$PWD" .venv/bin/python -m unittest tests.test_pipeline_rules tests.test_speakers tests.test_size_and_exclusion tests.test_prefetch tests.test_pdf tests.test_logging tests.test_youtube_classify -q
 ```

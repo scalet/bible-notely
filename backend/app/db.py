@@ -35,6 +35,10 @@ def ensure_schema() -> None:
         "video_md5": "TEXT NOT NULL DEFAULT ''",
         "warning": "TEXT NOT NULL DEFAULT ''",
         "summary_speaker_id": "INTEGER",
+        "youtube_id": "TEXT NOT NULL DEFAULT ''",
+        "youtube_url": "TEXT NOT NULL DEFAULT ''",
+        "youtube_title": "TEXT NOT NULL DEFAULT ''",
+        "youtube_uploaded_at": "DATETIME",
     }
     with engine.begin() as conn:
         rows = conn.exec_driver_sql("PRAGMA table_info(lectures)").fetchall()

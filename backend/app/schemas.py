@@ -48,6 +48,10 @@ class LectureOut(BaseModel):
     transcribed: bool
     summarized: bool
     uploaded: bool
+    youtube_id: str = ""
+    youtube_url: str = ""
+    youtube_title: str = ""
+    youtube_uploaded_at: datetime | None = None
     status: str
     error: str
     updated_at: datetime
