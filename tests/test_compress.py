@@ -136,7 +136,7 @@ class FailureKeepsOriginalTest(unittest.TestCase):
             source.write_bytes(b"camera-bytes")
             dest = folder / "a.compressed.mp4"
 
-            def fake_run(src, partial, config, progress=None, cancel=None):
+            def fake_run(src, partial, config, progress=None, cancel=None, **_extra):
                 partial.write_bytes(b"not-a-match")
 
             with (
@@ -163,7 +163,7 @@ class FailureKeepsOriginalTest(unittest.TestCase):
             cfg = CompressConfig(delete_original=False)
             profile = "v=h264;preset=veryfast;crf=23;h=0;a=copy"
 
-            def fake_run(src, partial, config, progress=None, cancel=None):
+            def fake_run(src, partial, config, progress=None, cancel=None, **_extra):
                 partial.write_bytes(b"new")
 
             with (
@@ -187,7 +187,7 @@ class FailureKeepsOriginalTest(unittest.TestCase):
             source.write_bytes(b"camera")
             dest.write_bytes(b"old-profile")
 
-            def fake_run(src, partial, config, progress=None, cancel=None):
+            def fake_run(src, partial, config, progress=None, cancel=None, **_extra):
                 partial.write_bytes(b"new")
 
             with (
@@ -230,7 +230,7 @@ class LectureRecordTest(unittest.TestCase):
         self.db.commit()
         calls = {"n": 0}
 
-        def fake_run(src, partial, config, progress=None, cancel=None):
+        def fake_run(src, partial, config, progress=None, cancel=None, **_extra):
             calls["n"] += 1
             partial.write_bytes(b"compressed-bytes")
 
@@ -259,7 +259,7 @@ class LectureRecordTest(unittest.TestCase):
         self.db.commit()
         calls = {"n": 0}
 
-        def fake_run(src, partial, config, progress=None, cancel=None):
+        def fake_run(src, partial, config, progress=None, cancel=None, **_extra):
             calls["n"] += 1
             partial.write_bytes(f"out-{calls['n']}".encode())
 
@@ -282,7 +282,7 @@ class LectureRecordTest(unittest.TestCase):
         lecture.video_size = source.stat().st_size
         self.db.commit()
 
-        def fake_run(src, partial, config, progress=None, cancel=None):
+        def fake_run(src, partial, config, progress=None, cancel=None, **_extra):
             partial.write_bytes(b"compressed-bytes")
 
         cfg = CompressConfig(delete_original=True, upload_drive=False)
@@ -304,7 +304,7 @@ class LectureRecordTest(unittest.TestCase):
             lecture.video_size = source.stat().st_size
             self.db.commit()
 
-            def fake_run(src, partial, config, progress=None, cancel=None):
+            def fake_run(src, partial, config, progress=None, cancel=None, **_extra):
                 partial.write_bytes(b"compressed-bytes")
 
             with (
@@ -343,7 +343,7 @@ class LectureRecordTest(unittest.TestCase):
         self.db.commit()
         calls = {"n": 0, "uploads": 0}
 
-        def fake_run(src, partial, config, progress=None, cancel=None):
+        def fake_run(src, partial, config, progress=None, cancel=None, **_extra):
             calls["n"] += 1
             partial.write_bytes(b"compressed-bytes")
 
@@ -393,7 +393,7 @@ class BackfillTest(unittest.TestCase):
         def locate(lecture: Lecture) -> Path:
             return Path(self.tmp.name) / lecture.video_filename
 
-        def fake_run(src, partial, config, progress=None, cancel=None):
+        def fake_run(src, partial, config, progress=None, cancel=None, **_extra):
             partial.write_bytes(b"out!")
 
         cfg = CompressConfig()

@@ -13,7 +13,7 @@ Repositório: [github.com/scalet/bible-notely](https://github.com/scalet/bible-n
 3. Baixa o próximo vídeo para `work/`.
 4. Extrai frames e compara o rosto com o cadastro local de palestrantes (OpenCV YuNet + SFace). Match fraco vai para revisão humana.
 5. Transcreve com Whisper (`medium`, português), no arquivo original. Enquanto isso, o próximo MP4 já pode começar a baixar.
-6. Comprime o MP4 (`libx264`, CRF 23, preset `veryfast`, áudio copiado). A duração precisa conferir com o original. O arquivo comprimido fica em `work/` e é o que o YouTube usa.
+6. Comprime o MP4 (`libx264`, CRF 23, preset `veryfast`, áudio copiado). No mesmo encode pode queimar os versículos citados (texto ARC) e a letra dos cânticos. A duração precisa conferir com o original. O arquivo comprimido fica em `work/` e é o que o YouTube usa.
 7. Pede à LLM só o resumo (Gemini, Grok, Claude ou Copilot). Os versículos vêm da ARC, sem paráfrase.
 8. Gera o PDF, a transcrição `.txt` e a nota do Obsidian.
 9. Envia `.txt` e `.pdf` de volta à pasta do dia. O MP4 da câmera no Drive não é substituído. No fim da aula a cópia local do original sai; o comprimido fica em `work/`. `COMPRESS_DELETE_ORIGINAL=false` guarda também essa cópia.
@@ -28,7 +28,7 @@ Nada disso entra no Git:
 |---|---|
 | `.env` | chaves de API, OAuth e IDs de pasta |
 | `keys/` | JSON de cliente OAuth / conta de serviço |
-| `data/` | banco, token do Google, logs, frames, modelos, cache da Bíblia, notas |
+| `data/` | banco, token do Google, logs, frames, modelos, cache da Bíblia, hinário, biblioteca de letras, notas |
 | `work/` | vídeos baixados, transcrições e PDFs em processamento |
 | `.venv/` e `frontend/node_modules/` | dependências instaladas |
 
@@ -130,6 +130,9 @@ PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-upload --max 1
 PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-sync
 PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli compress --max 1
 PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli compress --id 12 --fetch
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli hymnal --path "/caminho/Cantor_Cristão.zip"
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli hymnal --drive
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli overlay --id 12 --no-wait
 ```
 
 Na primeira identificação o programa baixa os modelos de rosto para `data/models/` (cerca de 40 MB). O modelo do Whisper (`medium`) baixa na primeira transcrição.
@@ -197,6 +200,16 @@ Na tela **Ajustes → Vídeo** dá para mudar isso sem editar o `.env`. O que fo
 | `COMPRESS_AUDIO_BITRATE` | `128k` | usado quando o áudio é reencodado |
 | `COMPRESS_DELETE_ORIGINAL` | `true` | no fim da aula, apaga o original local; `false` guarda |
 | `COMPRESS_UPLOAD_DRIVE` | `false` | sobe o comprimido para a pasta do dia |
+| `OVERLAY_ENABLED` | `true` | queima versículos e letras nesse encode |
+| `OVERLAY_WAIT_HOURS` | `24` | espera a letra; `0` não espera |
+
+## Versículos e letras
+
+O mesmo ffmpeg da compressão queima um lower-third: o texto ARC do versículo enquanto ele é citado, e a letra do cântico enquanto a congregação canta. A letra sai do Cantor Cristão (`cli hymnal --path` ou `cli hymnal --drive`, zip na pasta Igreja) e da biblioteca em `data/songs/`, que guarda o que alguém respondeu. Nada disso entra no git.
+
+Se a música não for reconhecida, a aula fica em **Pendências de letras** com o intervalo e cerca de 20 segundos de áudio. Dá para informar o número ou o nome, colar a letra, ou marcar **seguir sem letra**. O prazo em **Ajustes → Vídeo** (padrão 24 h, 0 = não espera) solta o vídeo com os versículos e as letras já achados. Gravação antes das 10h é EBD, até as 12h é o culto da manhã, depois é o da noite; a legenda entra nos três.
+
+`cli overlay --id 12` faz isso numa aula que já tem transcrição. `--no-wait` não pergunta. `--fetch` baixa o MP4 se a cópia local não estiver em `work/`.
 | `COMPRESS_DURATION_TOLERANCE` | `1` | diferença máxima de duração, em segundos |
 
 Aulas que já saíram do `run` (o MP4 local foi apagado antes desta etapa) entram por:

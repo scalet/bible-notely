@@ -191,7 +191,14 @@ def release_local_original(lecture: Lecture, video_path: Path) -> None:
     discard_camera_copy(video_path, output, keep=False)
 
 
-async def _compress_stage(db: Session, lecture: Lecture, video_path: Path) -> None:
+async def _compress_stage(
+    db: Session,
+    lecture: Lecture,
+    video_path: Path,
+    *,
+    ass_path: Path | None = None,
+    overlay_token: str = "",
+) -> None:
     set_pipeline(stage="compress", progress=0, message=f"Comprimindo {lecture.video_filename}")
     lecture.status = "compressing"
     _touch(lecture)
@@ -212,6 +219,8 @@ async def _compress_stage(db: Session, lecture: Lecture, video_path: Path) -> No
         source=source,
         progress=_progress,
         cancel=cancel_event,
+        ass_path=ass_path,
+        overlay_token=overlay_token,
     )
     set_pipeline(progress=None)
     if result.status == "missing":
@@ -304,6 +313,7 @@ STAGE_LABELS = {
     "download": "download do vídeo",
     "identify": "identificação do palestrante",
     "transcribe": "transcrição (Whisper)",
+    "lyrics": "versículos e letras",
     "compress": "compressão do vídeo",
     "summarize": "geração do resumo/PDF",
     "upload": "envio ao Drive",
@@ -383,6 +393,11 @@ def next_pending(db: Session, skip_ids: set[int] | None = None) -> Lecture | Non
             query = query.filter(~Lecture.id.in_(skip_ids))
         return query
 
+    from backend.app.services.overlays import lyrics_ready
+
+    for lecture in _query("awaiting_lyrics").order_by(Lecture.lecture_date.desc(), Lecture.id.desc()).all():
+        if lyrics_ready(db, lecture.id):
+            return lecture
     pending = _query("pending").order_by(Lecture.lecture_date.desc(), Lecture.id.desc()).first()
     if pending:
         return pending
@@ -569,7 +584,37 @@ async def process_one(
             set_pipeline(stage="compress", message=f"Ajuste de compressão inválido para {lecture.video_filename}")
             raise
         if compress_cfg.enabled:
-            await _compress_stage(db, lecture, video_path)
+            from backend.app.services.overlays import OverlayPlan, build_plan, load_overlay_config
+
+            if load_overlay_config().enabled:
+                set_pipeline(stage="lyrics", progress=None, message=f"Versículos e letras de {lecture.video_filename}")
+                plan = await asyncio.to_thread(
+                    build_plan,
+                    db,
+                    lecture,
+                    transcript,
+                    video_path if video_path.is_file() else None,
+                    no_wait=False,
+                )
+            else:
+                plan = OverlayPlan(cues=[], waiting=False, ass_path=None, token="", open_count=0)
+            if plan.waiting:
+                lecture.status = "awaiting_lyrics"
+                _touch(lecture)
+                db.commit()
+                set_pipeline(
+                    stage="lyrics",
+                    message=f"Aguardando letra em {lecture.video_filename}. O prazo está em Ajustes.",
+                )
+                log.info("aula %s aguardando letra (%s pendências)", lecture.id, plan.open_count)
+                return lecture
+            await _compress_stage(
+                db,
+                lecture,
+                video_path,
+                ass_path=plan.ass_path,
+                overlay_token=plan.token,
+            )
 
         if held_for_review:
             lecture.status = "needs_review"
@@ -716,11 +761,18 @@ async def _run_locked(db: Session, max_items: int) -> int:
                     break
             else:
                 failures = 0
-            if lecture.status == "needs_review":
+            if lecture.status in {"needs_review", "awaiting_lyrics"}:
                 continue
             processed += 1
         if processed == 0:
-            set_pipeline(message="Nada novo para processar", stage=None)
+            waiting = db.query(Lecture).filter(Lecture.status == "awaiting_lyrics").count()
+            if waiting:
+                set_pipeline(
+                    message=f"Aguardando letra de {waiting} aula(s). Responda em Pendências de letras ou espere o prazo.",
+                    stage="lyrics",
+                )
+            else:
+                set_pipeline(message="Nada novo para processar", stage=None)
         return processed
     finally:
         leftovers = [task for task in _prefetch.values() if not task.done()]

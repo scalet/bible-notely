@@ -12,7 +12,7 @@ const PROVIDERS = [
 const SECTIONS = [
   { id: "drive", label: "Google Drive", hint: "conexão e pasta raiz" },
   { id: "youtube", label: "YouTube", hint: "pasta do Drive para enviar" },
-  { id: "video", label: "Vídeo", hint: "compressão depois da transcrição" },
+  { id: "video", label: "Vídeo", hint: "compressão, versículos e letras" },
   { id: "ai", label: "Provedor de IA", hint: "quem escreve o resumo" },
   { id: "local", label: "Ambiente", hint: "whisper, modelo e fotos" },
 ] as const;
@@ -396,6 +396,8 @@ function VideoSection({
   const [bitrate, setBitrate] = useState(settings.compress_audio_bitrate || "128k");
   const [deleteOriginal, setDeleteOriginal] = useState(settings.compress_delete_original !== false);
   const [uploadDrive, setUploadDrive] = useState(Boolean(settings.compress_upload_drive));
+  const [overlay, setOverlay] = useState(settings.overlay_enabled !== false);
+  const [waitHours, setWaitHours] = useState(String(settings.overlay_wait_hours ?? 24));
 
   useEffect(() => {
     setEnabled(settings.compress_enabled !== false);
@@ -407,6 +409,8 @@ function VideoSection({
     setBitrate(settings.compress_audio_bitrate || "128k");
     setDeleteOriginal(settings.compress_delete_original !== false);
     setUploadDrive(Boolean(settings.compress_upload_drive));
+    setOverlay(settings.overlay_enabled !== false);
+    setWaitHours(String(settings.overlay_wait_hours ?? 24));
   }, [settings]);
 
   return (
@@ -480,6 +484,17 @@ function VideoSection({
           <input type="checkbox" checked={uploadDrive} onChange={(event) => setUploadDrive(event.target.checked)} />
           enviar o comprimido para a pasta do dia no Drive
         </label>
+        <label className="mb-2 flex items-center gap-2 text-xs text-fg">
+          <input type="checkbox" checked={overlay} onChange={(event) => setOverlay(event.target.checked)} />
+          queimar versículos e letras na compressão
+        </label>
+        <label className="mb-3 flex flex-col gap-1">
+          <span className={label}>Prazo da letra (horas)</span>
+          <input className={input} value={waitHours} inputMode="decimal" onChange={(event) => setWaitHours(event.target.value)} />
+          <span className="text-[11px] text-muted">
+            Se ninguém responder, o vídeo segue só com o que foi encontrado. 0 não espera. O padrão é 24.
+          </span>
+        </label>
         <button
           className={btnPrimary}
           disabled={Boolean(busy)}
@@ -487,6 +502,8 @@ function VideoSection({
             void onSave("compress", async () => {
               const parsed = Number(crf);
               if (!Number.isInteger(parsed)) throw new Error("CRF precisa ser um número inteiro");
+              const hours = Number(waitHours.replace(",", "."));
+              if (!Number.isFinite(hours) || hours < 0) throw new Error("O prazo da letra precisa ser um número de horas, 0 ou mais");
               await api.saveSettings({
                 compress_enabled: enabled,
                 compress_crf: parsed,
@@ -497,9 +514,11 @@ function VideoSection({
                 compress_audio_bitrate: bitrate,
                 compress_delete_original: deleteOriginal,
                 compress_upload_drive: uploadDrive,
+                overlay_enabled: overlay,
+                overlay_wait_hours: hours,
               });
               await onChange();
-              return enabled ? "Compressão ligada." : "Compressão desligada.";
+              return overlay ? "Vídeo salvo, com letras na compressão." : "Vídeo salvo, sem letras na tela.";
             })
           }
         >

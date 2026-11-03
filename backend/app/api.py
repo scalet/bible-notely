@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.config import settings
 from backend.app.db import SessionLocal, get_db
-from backend.app.models import Lecture, Speaker
+from backend.app.models import Lecture, LyricPending, Speaker
 from backend.app.runtime import (
     get_ai_provider,
     get_drive_video_count,
@@ -33,6 +33,8 @@ from backend.app.schemas import (
     AssignSpeakerIn,
     LectureOut,
     PipelineStatus,
+    LyricPendingOut,
+    LyricResolveIn,
     SettingsIn,
     SettingsOut,
     SpeakerIn,
@@ -43,6 +45,14 @@ from backend.app.schemas import (
 from backend.app.services import youtube as youtube_service
 from backend.app.services import drive
 from backend.app.services.compress import CompressError, merged_config, validate_config
+from backend.app.services.overlays import (
+    OverlayError,
+    actionable_pendings,
+    clock_label,
+    load_overlay_config,
+    resolve_pending,
+    snippet_file,
+)
 from backend.app.services.llm import provider_flags
 from backend.app.services.pipeline import (
     RESTART_STAGES,
@@ -111,6 +121,7 @@ def _settings_out(db: Session) -> SettingsOut:
     provider = get_ai_provider()
     stats = youtube_service.youtube_scope_stats(db)
     compress = merged_config()
+    overlay = load_overlay_config()
     return SettingsOut(
         google_connected=drive.is_connected(),
         google_account=drive.google_account(),
@@ -144,6 +155,8 @@ def _settings_out(db: Session) -> SettingsOut:
         compress_delete_original=compress.delete_original,
         compress_upload_drive=compress.upload_drive,
         compress_duration_tolerance=compress.duration_tolerance,
+        overlay_enabled=overlay.enabled,
+        overlay_wait_hours=overlay.wait_hours,
     )
 
 
@@ -189,9 +202,62 @@ def put_settings(body: SettingsIn, db: Session = Depends(get_db)) -> SettingsOut
             validate_config(replace(merged_config(), **compress_updates))
         except CompressError as exc:
             raise HTTPException(400, str(exc)) from exc
+    if body.overlay_enabled is not None:
+        payload["overlay_enabled"] = bool(body.overlay_enabled)
+    if body.overlay_wait_hours is not None:
+        if body.overlay_wait_hours < 0 or body.overlay_wait_hours > 24 * 14:
+            raise HTTPException(400, "O prazo da letra fica entre 0 e 336 horas. 0 não espera.")
+        payload["overlay_wait_hours"] = body.overlay_wait_hours
     if payload:
         update_runtime(**payload)
     return _settings_out(db)
+
+
+def _lyric_out(row: LyricPending) -> LyricPendingOut:
+    lecture = row.lecture
+    return LyricPendingOut(
+        id=row.id,
+        lecture_id=row.lecture_id,
+        lecture_filename=lecture.video_filename if lecture else "",
+        start_seconds=row.start_seconds,
+        end_seconds=row.end_seconds,
+        start_label=clock_label(row.start_seconds),
+        end_label=clock_label(row.end_seconds),
+        transcript_excerpt=row.transcript_excerpt,
+        status=row.status,
+        title=row.title,
+        snippet_url=f"/api/lyrics/{row.id}/audio" if row.snippet_path else None,
+        created_at=row.created_at,
+        deadline_at=row.deadline_at,
+    )
+
+
+@router.get("/lyrics/pending", response_model=list[LyricPendingOut])
+def list_lyric_pendings(db: Session = Depends(get_db)) -> list[LyricPendingOut]:
+    return [_lyric_out(row) for row in actionable_pendings(db)]
+
+
+@router.get("/lyrics/{pending_id}/audio")
+def lyric_audio(pending_id: int, db: Session = Depends(get_db)):
+    row = db.get(LyricPending, pending_id)
+    if row is None:
+        raise HTTPException(404, "Pendência não encontrada")
+    path = snippet_file(row)
+    if path is None:
+        raise HTTPException(404, "Trecho de áudio indisponível")
+    return FileResponse(path, media_type="audio/mp4", filename=path.name)
+
+
+@router.post("/lyrics/{pending_id}/resolve", response_model=LyricPendingOut)
+def lyric_resolve(pending_id: int, body: LyricResolveIn, db: Session = Depends(get_db)) -> LyricPendingOut:
+    row = db.get(LyricPending, pending_id)
+    if row is None:
+        raise HTTPException(404, "Pendência não encontrada")
+    try:
+        resolve_pending(db, row, body.action, query=body.query, lyrics=body.lyrics, title=body.title)
+    except OverlayError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return _lyric_out(row)
 
 
 @router.get("/youtube/browse", response_model=YouTubeBrowseOut)
@@ -537,7 +603,7 @@ def exclude_lecture(lecture_id: int, db: Session = Depends(get_db)) -> LectureOu
     lecture = db.get(Lecture, lecture_id)
     if not lecture:
         raise HTTPException(404, "Aula não encontrada")
-    if lecture.status not in {"pending", "failed", "needs_review", "skipped"}:
+    if lecture.status not in {"pending", "failed", "needs_review", "skipped", "awaiting_lyrics"}:
         raise HTTPException(409, f"Aula em '{lecture.status}' não pode ser excluída da importação")
     if _busy_with(lecture):
         raise HTTPException(409, "Aula em uso pelo pipeline; pause ou cancele antes")
