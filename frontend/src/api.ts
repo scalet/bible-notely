@@ -28,6 +28,10 @@ export type Lecture = {
   summary_text: string;
   warning?: string;
   video_size?: number;
+  original_size?: number;
+  compressed?: boolean;
+  compressed_size?: number;
+  compressed_profile?: string;
   transcribed: boolean;
   summarized: boolean;
   uploaded: boolean;
@@ -57,6 +61,16 @@ export type Settings = {
   youtube_scope_eligible?: number;
   youtube_scope_pending?: number;
   youtube_scope_uploaded?: number;
+  compress_enabled?: boolean;
+  compress_crf?: number;
+  compress_preset?: string;
+  compress_max_height?: number;
+  compress_codec?: string;
+  compress_audio?: string;
+  compress_audio_bitrate?: string;
+  compress_delete_original?: boolean;
+  compress_upload_drive?: boolean;
+  compress_duration_tolerance?: number;
 };
 
 export type YouTubeFolder = {
@@ -112,6 +126,16 @@ export const api = {
     google_drive_folder_id?: string;
     youtube_upload_folder_id?: string;
     youtube_upload_path?: string;
+    compress_enabled?: boolean;
+    compress_crf?: number;
+    compress_preset?: string;
+    compress_max_height?: number;
+    compress_codec?: string;
+    compress_audio?: string;
+    compress_audio_bitrate?: string;
+    compress_delete_original?: boolean;
+    compress_upload_drive?: boolean;
+    compress_duration_tolerance?: number;
   }) =>
     req<Settings>("/api/settings", {
       method: "PUT",

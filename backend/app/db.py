@@ -39,6 +39,12 @@ def ensure_schema() -> None:
         "youtube_url": "TEXT NOT NULL DEFAULT ''",
         "youtube_title": "TEXT NOT NULL DEFAULT ''",
         "youtube_uploaded_at": "DATETIME",
+        "original_size": "INTEGER NOT NULL DEFAULT 0",
+        "compressed": "INTEGER NOT NULL DEFAULT 0",
+        "compressed_path": "TEXT NOT NULL DEFAULT ''",
+        "compressed_size": "INTEGER NOT NULL DEFAULT 0",
+        "compressed_profile": "TEXT NOT NULL DEFAULT ''",
+        "compressed_drive_file_id": "TEXT NOT NULL DEFAULT ''",
     }
     with engine.begin() as conn:
         rows = conn.exec_driver_sql("PRAGMA table_info(lectures)").fetchall()

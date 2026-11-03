@@ -12,9 +12,12 @@ const PROVIDERS = [
 const SECTIONS = [
   { id: "drive", label: "Google Drive", hint: "conexão e pasta raiz" },
   { id: "youtube", label: "YouTube", hint: "pasta do Drive para enviar" },
+  { id: "video", label: "Vídeo", hint: "compressão depois da transcrição" },
   { id: "ai", label: "Provedor de IA", hint: "quem escreve o resumo" },
   { id: "local", label: "Ambiente", hint: "whisper, modelo e fotos" },
 ] as const;
+
+const PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"];
 
 type SectionId = (typeof SECTIONS)[number]["id"];
 
@@ -152,6 +155,8 @@ export function SettingsPage({
           onSave={save}
           onChange={onChange}
         />
+      ) : section === "video" ? (
+        <VideoSection settings={settings} busy={busy} note={note} onClose={() => setSection(null)} onSave={save} onChange={onChange} />
       ) : section === "ai" ? (
         <aside className={sidePanel}>
           <SectionHeader title="Provedor de IA" onClose={() => setSection(null)} />
@@ -208,7 +213,7 @@ export function SettingsPage({
       ) : (
         <aside className="hidden min-h-0 w-[420px] shrink-0 flex-col justify-center rounded-xl border border-dashed border-line-2 px-6 text-center lg:flex xl:w-[480px]">
           <p className="m-0 text-sm text-fg">Selecione uma seção</p>
-          <p className={`${muted} mt-1`}>Drive, IA e ambiente ficam separados para não misturar a manutenção.</p>
+          <p className={`${muted} mt-1`}>Drive, vídeo, IA e ambiente ficam separados para não misturar a manutenção.</p>
         </aside>
       )}
     </div>
@@ -361,6 +366,145 @@ function YouTubeSection({
             limpar seleção
           </button>
         </div>
+        {note ? <p className="mt-3 rounded-lg bg-raised px-3 py-2 text-xs text-fg">{note}</p> : null}
+      </div>
+    </aside>
+  );
+}
+
+function VideoSection({
+  settings,
+  busy,
+  note,
+  onClose,
+  onSave,
+  onChange,
+}: {
+  settings: Settings;
+  busy: string;
+  note: string;
+  onClose: () => void;
+  onSave: (key: string, action: () => Promise<string>) => void;
+  onChange: () => Promise<void>;
+}) {
+  const [enabled, setEnabled] = useState(settings.compress_enabled !== false);
+  const [crf, setCrf] = useState(String(settings.compress_crf ?? 23));
+  const [preset, setPreset] = useState(settings.compress_preset || "veryfast");
+  const [maxHeight, setMaxHeight] = useState(String(settings.compress_max_height ?? 0));
+  const [codec, setCodec] = useState(settings.compress_codec || "h264");
+  const [audio, setAudio] = useState(settings.compress_audio || "copy");
+  const [bitrate, setBitrate] = useState(settings.compress_audio_bitrate || "128k");
+  const [deleteOriginal, setDeleteOriginal] = useState(Boolean(settings.compress_delete_original));
+  const [uploadDrive, setUploadDrive] = useState(Boolean(settings.compress_upload_drive));
+
+  useEffect(() => {
+    setEnabled(settings.compress_enabled !== false);
+    setCrf(String(settings.compress_crf ?? 23));
+    setPreset(settings.compress_preset || "veryfast");
+    setMaxHeight(String(settings.compress_max_height ?? 0));
+    setCodec(settings.compress_codec || "h264");
+    setAudio(settings.compress_audio || "copy");
+    setBitrate(settings.compress_audio_bitrate || "128k");
+    setDeleteOriginal(Boolean(settings.compress_delete_original));
+    setUploadDrive(Boolean(settings.compress_upload_drive));
+  }, [settings]);
+
+  return (
+    <aside className={sidePanel}>
+      <SectionHeader title="Vídeo" onClose={onClose} />
+      <div className="min-h-0 flex-1 overflow-auto px-4 py-3">
+        <p className={`${muted} mt-0 text-xs`}>
+          Roda depois da transcrição, no arquivo original. O comprimido fica em{" "}
+          <span className={mono}>work/</span> e é o que o YouTube envia. O original local só sai se você pedir.
+        </p>
+        <label className="mb-3 flex items-center gap-2 text-xs text-fg">
+          <input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />
+          comprimir automaticamente
+        </label>
+        <div className="mb-2.5 grid grid-cols-2 gap-2">
+          <label className="flex flex-col gap-1">
+            <span className={label}>CRF</span>
+            <input className={input} value={crf} inputMode="numeric" onChange={(event) => setCrf(event.target.value)} />
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className={label}>Preset</span>
+            <select className={input} value={preset} onChange={(event) => setPreset(event.target.value)}>
+              {PRESETS.map((item) => (
+                <option key={item} value={item}>
+                  {item}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className={label}>Altura máxima</span>
+            <select className={input} value={maxHeight} onChange={(event) => setMaxHeight(event.target.value)}>
+              <option value="0">manter original</option>
+              <option value="480">480</option>
+              <option value="720">720</option>
+              <option value="1080">1080</option>
+            </select>
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className={label}>Codec</span>
+            <select className={input} value={codec} onChange={(event) => setCodec(event.target.value)}>
+              <option value="h264">H.264</option>
+              <option value="h265">H.265</option>
+            </select>
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className={label}>Áudio</span>
+            <select className={input} value={audio} onChange={(event) => setAudio(event.target.value)}>
+              <option value="copy">copiar</option>
+              <option value="aac">AAC</option>
+            </select>
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className={label}>Bitrate AAC</span>
+            <select
+              className={input}
+              value={bitrate}
+              disabled={audio !== "aac"}
+              onChange={(event) => setBitrate(event.target.value)}
+            >
+              <option value="96k">96k</option>
+              <option value="128k">128k</option>
+            </select>
+          </label>
+        </div>
+        <label className="mb-2 flex items-center gap-2 text-xs text-fg">
+          <input type="checkbox" checked={deleteOriginal} onChange={(event) => setDeleteOriginal(event.target.checked)} />
+          apagar o original local depois que a duração conferir
+        </label>
+        <label className="mb-3 flex items-center gap-2 text-xs text-fg">
+          <input type="checkbox" checked={uploadDrive} onChange={(event) => setUploadDrive(event.target.checked)} />
+          enviar o comprimido para a pasta do dia no Drive
+        </label>
+        <button
+          className={btnPrimary}
+          disabled={Boolean(busy)}
+          onClick={() =>
+            void onSave("compress", async () => {
+              const parsed = Number(crf);
+              if (!Number.isInteger(parsed)) throw new Error("CRF precisa ser um número inteiro");
+              await api.saveSettings({
+                compress_enabled: enabled,
+                compress_crf: parsed,
+                compress_preset: preset,
+                compress_max_height: Number(maxHeight),
+                compress_codec: codec,
+                compress_audio: audio,
+                compress_audio_bitrate: bitrate,
+                compress_delete_original: deleteOriginal,
+                compress_upload_drive: uploadDrive,
+              });
+              await onChange();
+              return enabled ? "Compressão ligada." : "Compressão desligada.";
+            })
+          }
+        >
+          {busy === "compress" ? "salvando…" : "salvar vídeo"}
+        </button>
         {note ? <p className="mt-3 rounded-lg bg-raised px-3 py-2 text-xs text-fg">{note}</p> : null}
       </div>
     </aside>

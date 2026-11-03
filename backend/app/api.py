@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -41,6 +42,7 @@ from backend.app.schemas import (
 )
 from backend.app.services import youtube as youtube_service
 from backend.app.services import drive
+from backend.app.services.compress import CompressError, merged_config, validate_config
 from backend.app.services.llm import provider_flags
 from backend.app.services.pipeline import (
     RESTART_STAGES,
@@ -108,6 +110,7 @@ def health() -> dict:
 def _settings_out(db: Session) -> SettingsOut:
     provider = get_ai_provider()
     stats = youtube_service.youtube_scope_stats(db)
+    compress = merged_config()
     return SettingsOut(
         google_connected=drive.is_connected(),
         google_account=drive.google_account(),
@@ -131,6 +134,16 @@ def _settings_out(db: Session) -> SettingsOut:
         youtube_scope_eligible=stats["eligible"],
         youtube_scope_pending=stats["pending_youtube"],
         youtube_scope_uploaded=stats["on_youtube"],
+        compress_enabled=compress.enabled,
+        compress_crf=compress.crf,
+        compress_preset=compress.preset,
+        compress_max_height=compress.max_height,
+        compress_codec=compress.codec,
+        compress_audio=compress.audio,
+        compress_audio_bitrate=compress.audio_bitrate,
+        compress_delete_original=compress.delete_original,
+        compress_upload_drive=compress.upload_drive,
+        compress_duration_tolerance=compress.duration_tolerance,
     )
 
 
@@ -153,6 +166,29 @@ def put_settings(body: SettingsIn, db: Session = Depends(get_db)) -> SettingsOut
         payload["youtube_upload_folder_id"] = body.youtube_upload_folder_id.strip()
     if body.youtube_upload_path is not None:
         payload["youtube_upload_path"] = body.youtube_upload_path.replace("\\", "/").strip("/")
+    compress_fields = {
+        "compress_enabled": "enabled",
+        "compress_crf": "crf",
+        "compress_preset": "preset",
+        "compress_max_height": "max_height",
+        "compress_codec": "codec",
+        "compress_audio": "audio",
+        "compress_audio_bitrate": "audio_bitrate",
+        "compress_delete_original": "delete_original",
+        "compress_upload_drive": "upload_drive",
+        "compress_duration_tolerance": "duration_tolerance",
+    }
+    compress_updates = {}
+    for key, attr in compress_fields.items():
+        value = getattr(body, key)
+        if value is not None:
+            payload[key] = value
+            compress_updates[attr] = value
+    if compress_updates:
+        try:
+            validate_config(replace(merged_config(), **compress_updates))
+        except CompressError as exc:
+            raise HTTPException(400, str(exc)) from exc
     if payload:
         update_runtime(**payload)
     return _settings_out(db)
