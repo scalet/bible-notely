@@ -171,20 +171,24 @@ def _remove_local_video(lecture: Lecture) -> bool:
 
 
 def release_local_original(lecture: Lecture, video_path: Path) -> None:
-    """Tira a cópia local da câmera quando a compressão não pediu para guardá-la.
+    """Tira a cópia local da câmera no fim da aula.
 
-    Sem aula comprimida, o comportamento anterior permanece: o MP4 sai depois do
-    envio ao Drive (ou ao ir para revisão). Com compressão gravada e
-    `delete_original` desligado, original e comprimido ficam em work/.
+    O original continua no Drive. O comprimido, se houver, fica em work/.
+    Isso só roda quando a aula terminou (enviada, ou parada para revisão):
+    uma falha no resumo ainda encontra o MP4 da câmera. `delete_original`
+    desligado guarda essa cópia também.
     """
+    from backend.app.services.compress import discard_camera_copy, resolve_stored_path
+
     try:
         keep = lecture.compressed and not load_compress_config().delete_original
     except Exception:
-        keep = bool(lecture.compressed)
+        keep = False
     if keep:
         log.info("original local mantido: %s", video_path.name)
         return
-    video_path.unlink(missing_ok=True)
+    output = resolve_stored_path(lecture.compressed_path) if lecture.compressed_path else None
+    discard_camera_copy(video_path, output, keep=False)
 
 
 async def _compress_stage(db: Session, lecture: Lecture, video_path: Path) -> None:

@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     whisper_model: str = "medium"
     whisper_language: str = "pt"
 
-    # Reencode depois da transcrição. O original local só some se delete_original estiver ligado.
+    # Reencode depois da transcrição. O original local sai no fim da aula; false guarda a cópia.
     compress_enabled: bool = True
     compress_crf: int = 23
     compress_preset: str = "veryfast"
@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     compress_codec: str = "h264"  # h264 | h265
     compress_audio: str = "copy"  # copy | aac
     compress_audio_bitrate: str = "128k"
-    compress_delete_original: bool = False
+    compress_delete_original: bool = True
     compress_upload_drive: bool = False
     compress_duration_tolerance: float = 1.0
 

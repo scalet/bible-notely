@@ -2,8 +2,9 @@
 
 O Whisper e o reconhecimento de rosto continuam no arquivo da câmera. Este passo
 grava `{stem}.compressed.mp4` ao lado do original e só então marca a aula. A
-duração (ffprobe) precisa bater com a origem. O original fica no disco até a
-conferência passar e, por padrão, continua lá depois — apagar é opt-in.
+duração (ffprobe) precisa bater com a origem. O original local só sai depois
+que o resto da aula termina; o arquivo da câmera continua no Drive. O
+comprimido fica.
 
 O arquivo comprimido é o que o YouTube usa e o que um futuro Bunny Stream ou
 backup deve copiar. O perfil (codec, CRF, preset, altura, áudio) entra no
@@ -66,7 +67,7 @@ class CompressConfig:
     codec: str = "h264"
     audio: str = "copy"
     audio_bitrate: str = "128k"
-    delete_original: bool = False
+    delete_original: bool = True
     upload_drive: bool = False
     duration_tolerance: float = 1.0
 
@@ -194,18 +195,27 @@ def validate_config(config: CompressConfig) -> CompressConfig:
 
 def profile_of(config: CompressConfig) -> str:
     audio = "copy" if config.audio == "copy" else f"aac:{config.audio_bitrate}"
-    return f"v={config.codec};preset={config.preset};crf={config.crf};h={config.max_height};a={audio}"
+    # fit=ar distingue o teto de altura que preserva a proporção do filtro antigo,
+    # que esticava o quadro. Sem teto o perfil não muda, para não reencodar o que já ficou certo.
+    fit = ";fit=ar" if config.max_height else ""
+    return f"v={config.codec};preset={config.preset};crf={config.crf};h={config.max_height}{fit};a={audio}"
 
 
 def compressed_output_path(source: Path) -> Path:
     return source.with_name(f"{source.stem}.compressed.mp4")
 
 
-def scale_filter(max_height: int) -> str:
-    """Altura par (yuv420p). Com max_height, não aumenta o vídeo."""
-    if max_height:
-        return f"scale=trunc(iw/2)*2:trunc(min({max_height}\\,ih)/2)*2"
-    return "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+_PROFILE_PREFIX = "bible-notely "
+
+
+def scale_filter(max_height: int) -> str | None:
+    """Limita a altura e mantém a proporção. -2 deixa a largura par.
+
+    Sem teto, não há filtro: o quadro da câmera segue igual.
+    """
+    if not max_height:
+        return None
+    return f"scale=-2:'min({int(max_height)},ih)',setsar=1"
 
 
 def build_ffmpeg_command(source: Path, dest: Path, config: CompressConfig) -> list[str]:
@@ -227,9 +237,10 @@ def build_ffmpeg_command(source: Path, dest: Path, config: CompressConfig) -> li
         str(config.crf),
         "-pix_fmt",
         "yuv420p",
-        "-vf",
-        scale_filter(config.max_height),
     ]
+    vf = scale_filter(config.max_height)
+    if vf:
+        cmd += ["-vf", vf]
     if config.codec == "h265":
         cmd += ["-tag:v", "hvc1"]
     if config.audio == "aac":
@@ -237,6 +248,8 @@ def build_ffmpeg_command(source: Path, dest: Path, config: CompressConfig) -> li
     else:
         cmd += ["-c:a", "copy"]
     cmd += [
+        "-metadata",
+        f"comment={_PROFILE_PREFIX}{profile_of(config)}",
         "-movflags",
         "+faststart",
         "-progress",
@@ -326,12 +339,32 @@ def durations_match(source: Path, dest: Path, tolerance: float) -> tuple[bool, s
     return True, ""
 
 
+def embedded_profile(path: Path) -> str:
+    """Perfil gravado no comment do MP4. Vazio se o arquivo é de uma versão anterior."""
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format_tags=comment",
+        "-of",
+        "default=nokey=1:noprint_wrappers=1",
+        str(path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    text = result.stdout.strip()
+    if text.startswith(_PROFILE_PREFIX):
+        return text[len(_PROFILE_PREFIX) :]
+    return ""
+
+
 def output_is_valid(
     source: Path | None,
     dest: Path,
     config: CompressConfig,
     *,
     expected_size: int = 0,
+    profile: str | None = None,
 ) -> bool:
     if not dest.is_file():
         return False
@@ -340,10 +373,31 @@ def output_is_valid(
         return False
     if expected_size and size != expected_size:
         return False
+    if profile is not None and embedded_profile(dest) != profile:
+        return False
     if source is not None and source.is_file():
         ok, _reason = durations_match(source, dest, config.duration_tolerance)
         return ok
     return video_duration(dest) is not None
+
+
+def store_compressed_path(path: Path) -> str:
+    """Caminho relativo a work/ quando o arquivo está lá. Absoluto antigo continua válido."""
+    resolved = path.resolve()
+    root = settings.work_dir.resolve()
+    try:
+        return resolved.relative_to(root).as_posix()
+    except ValueError:
+        return str(resolved)
+
+
+def resolve_stored_path(stored: str) -> Path:
+    path = Path(stored)
+    if not stored:
+        return path
+    if path.is_absolute():
+        return path
+    return (settings.work_dir / path).resolve()
 
 
 def _record_matches(lecture: Lecture, dest: Path, config: CompressConfig) -> bool:
@@ -351,7 +405,7 @@ def _record_matches(lecture: Lecture, dest: Path, config: CompressConfig) -> boo
         return False
     if (lecture.compressed_profile or "") != profile_of(config):
         return False
-    if lecture.compressed_path and Path(lecture.compressed_path).resolve() != dest.resolve():
+    if lecture.compressed_path and resolve_stored_path(lecture.compressed_path) != dest.resolve():
         return False
     return output_is_valid(
         None,
@@ -368,12 +422,12 @@ def compress_file(
     progress: Callable[[float], None] | None = None,
     cancel: Event | None = None,
     *,
-    reuse: bool = True,
+    reuse: bool = False,
 ) -> CompressResult:
     """Encode para um arquivo ao lado do original. Não apaga a origem.
 
-    `reuse=False` força outro encode mesmo se o destino já tiver a mesma duração
-    (perfil diferente: CRF, altura, codec).
+    `reuse=True` só pula o encode se a duração e o perfil gravado no arquivo
+    forem os mesmos. Duração igual com outro CRF, altura ou codec não serve.
     """
     config = validate_config(config or load_compress_config())
     if not source.is_file() or source.stat().st_size <= 0:
@@ -382,7 +436,7 @@ def compress_file(
     if dest.resolve() == source.resolve():
         raise CompressError("o destino da compressão não pode ser o próprio original")
     profile = profile_of(config)
-    if reuse and output_is_valid(source, dest, config):
+    if reuse and output_is_valid(source, dest, config, profile=profile):
         log.info("compressão reaproveitada: %s", dest.name)
         return CompressResult(
             status="skipped",
@@ -442,7 +496,7 @@ def _dest_for(lecture: Lecture, source: Path | None) -> Path | None:
     if source is not None:
         return compressed_output_path(source)
     if lecture.compressed_path:
-        return Path(lecture.compressed_path)
+        return resolve_stored_path(lecture.compressed_path)
     return None
 
 
@@ -450,7 +504,7 @@ def preferred_upload_source(lecture: Lecture) -> Path | None:
     """Arquivo comprimido local, se o registro e o tamanho batem."""
     if not lecture.compressed or not lecture.compressed_path:
         return None
-    path = Path(lecture.compressed_path)
+    path = resolve_stored_path(lecture.compressed_path)
     if not path.is_file() or path.stat().st_size <= 0:
         return None
     if lecture.compressed_size and path.stat().st_size != lecture.compressed_size:
@@ -510,21 +564,11 @@ def compress_lecture(
         assert result.output is not None
         lecture.original_size = result.original_size
         lecture.compressed = True
-        lecture.compressed_path = str(result.output.resolve())
+        lecture.compressed_path = store_compressed_path(result.output)
         lecture.compressed_size = result.compressed_size
         lecture.compressed_profile = result.profile
         _touch(lecture)
         db.commit()
-
-    if (
-        config.delete_original
-        and source is not None
-        and source.is_file()
-        and result.output is not None
-        and source.resolve() != result.output.resolve()
-    ):
-        log.info("apagando original local depois da conferência: %s", source)
-        source.unlink()
 
     if config.upload_drive and result.output is not None and (result.status == "compressed" or not lecture.compressed_drive_file_id):
         if not lecture.drive_folder_id:
@@ -557,6 +601,16 @@ def _fetch_source(lecture: Lecture, dest: Path) -> None:
         expected_size=lecture.video_size or 0,
         expected_md5=lecture.video_md5 or "",
     )
+
+
+def discard_camera_copy(source: Path | None, output: Path | None, *, keep: bool) -> None:
+    """Apaga a cópia local da câmera. O comprimido fica."""
+    if keep or source is None or not source.is_file():
+        return
+    if output is not None and source.resolve() == output.resolve():
+        return
+    log.info("apagando original local; o comprimido fica: %s", source.name)
+    source.unlink()
 
 
 def _needs_attention(lecture: Lecture, source: Path | None, config: CompressConfig) -> bool:
@@ -651,6 +705,8 @@ def compress_backfill(
             else:
                 missing += 1
                 log.info("aula %s sem MP4 local", lecture.id)
+            if result.status in {"compressed", "skipped"}:
+                discard_camera_copy(source, result.output, keep=not config.delete_original)
         if lecture_id is not None or attempts >= limit:
             break
     return compressed, skipped, missing, failed

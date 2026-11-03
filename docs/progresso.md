@@ -4,7 +4,7 @@ Atualizado em 2026-11-03. O que ainda falta está em [pendencias.md](pendencias.
 
 ## O que foi feito em 2026-11-03
 
-- Compressão automática depois da transcrição (`backend/app/services/compress.py`). O original segue para o Whisper; o arquivo `{stem}.compressed.mp4` fica em `work/` e é o que o YouTube envia quando existe. ffprobe confere a duração (tolerância 1s) antes de gravar `compressed`, `compressed_path`, `compressed_size`, `original_size` e `compressed_profile`. Passo idempotente: mesmo perfil e arquivo válido é pulado. Original local não é apagado por padrão. Upload do comprimido para a pasta do dia fica desligado. Ajustes em **Ajustes → Vídeo** (`data/runtime.json`) ou no `.env`. CLI: `compress --max 1` e `compress --id N --fetch`. Testes em `tests/test_compress.py`.
+- Compressão automática depois da transcrição (`backend/app/services/compress.py`). O original segue para o Whisper; o arquivo `{stem}.compressed.mp4` fica em `work/` e é o que o YouTube envia quando existe. ffprobe confere a duração (tolerância 1s) antes de gravar `compressed`, `compressed_path` (relativo a `work/`), `compressed_size`, `original_size` e `compressed_profile`. O mesmo perfil e um arquivo válido pulam o encode. No fim da aula o original local sai (`COMPRESS_DELETE_ORIGINAL=true`); o Drive continua com a câmera e o comprimido fica. `COMPRESS_MAX_HEIGHT` reduz a altura sem esticar. Ajustes em **Ajustes → Vídeo**. CLI: `compress --max 1` e `compress --id N --fetch`. Colunas novas entram ao abrir o SQLite, não só no CLI. Testes em `tests/test_compress.py`.
 
 ## O que foi feito em 2026-10-20 (noite)
 

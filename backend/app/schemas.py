@@ -89,7 +89,7 @@ class SettingsOut(BaseModel):
     compress_codec: str = "h264"
     compress_audio: str = "copy"
     compress_audio_bitrate: str = "128k"
-    compress_delete_original: bool = False
+    compress_delete_original: bool = True
     compress_upload_drive: bool = False
     compress_duration_tolerance: float = 1.0
 

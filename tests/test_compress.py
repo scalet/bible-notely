@@ -26,6 +26,7 @@ from backend.app.services.compress import (
     compress_file,
     compress_lecture,
     preferred_upload_source,
+    resolve_stored_path,
     validate_config,
 )
 from backend.app.services.pipeline import lecture_work_dir, process_one, release_local_original
@@ -102,7 +103,7 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-crf") + 1], "23")
         self.assertEqual(cmd[cmd.index("-c:a") + 1], "copy")
         self.assertNotIn("-b:a", cmd)
-        self.assertIn("scale=trunc(iw/2)*2:trunc(ih/2)*2", cmd)
+        self.assertNotIn("-vf", cmd)
         self.assertIn("+faststart", cmd)
         self.assertEqual(cmd[-1], "camera.compressed.mp4")
 
@@ -114,7 +115,7 @@ class CommandTest(unittest.TestCase):
         )
         self.assertIn("libx265", cmd)
         self.assertIn("hvc1", cmd)
-        self.assertIn(r"scale=trunc(iw/2)*2:trunc(min(720\,ih)/2)*2", cmd)
+        self.assertIn("scale=-2:'min(720,ih)',setsar=1", cmd)
         self.assertEqual(cmd[cmd.index("-b:a") + 1], "96k")
 
     def test_rejects_bad_settings(self) -> None:
@@ -152,21 +153,52 @@ class FailureKeepsOriginalTest(unittest.TestCase):
             self.assertFalse((folder / "a.compressed.part.mp4").exists())
             self.assertEqual(source.read_bytes(), b"camera-bytes")
 
-    def test_reuse_skips_ffmpeg_when_duration_matches(self) -> None:
+    def test_reuse_requires_the_same_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
             source = folder / "a.mp4"
             dest = folder / "a.compressed.mp4"
             source.write_bytes(b"camera")
             dest.write_bytes(b"already")
+            cfg = CompressConfig(delete_original=False)
+            profile = "v=h264;preset=veryfast;crf=23;h=0;a=copy"
+
+            def fake_run(src, partial, config, progress=None, cancel=None):
+                partial.write_bytes(b"new")
+
             with (
                 mock.patch("backend.app.services.compress.video_duration", return_value=5.0),
-                mock.patch("backend.app.services.compress._run_ffmpeg") as encode,
+                mock.patch("backend.app.services.compress.embedded_profile", return_value=profile),
+                mock.patch("backend.app.services.compress._run_ffmpeg", side_effect=fake_run) as encode,
             ):
-                result = compress_file(source, dest, CompressConfig())
-            encode.assert_not_called()
-            self.assertEqual(result.status, "skipped")
-            self.assertEqual(dest.read_bytes(), b"already")
+                reused = compress_file(source, dest, cfg, reuse=True)
+                encode.assert_not_called()
+                self.assertEqual(reused.status, "skipped")
+                self.assertEqual(dest.read_bytes(), b"already")
+                forced = compress_file(source, dest, cfg)
+            encode.assert_called_once()
+            self.assertEqual(forced.status, "compressed")
+
+    def test_reuse_rejects_a_different_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            source = folder / "a.mp4"
+            dest = folder / "a.compressed.mp4"
+            source.write_bytes(b"camera")
+            dest.write_bytes(b"old-profile")
+
+            def fake_run(src, partial, config, progress=None, cancel=None):
+                partial.write_bytes(b"new")
+
+            with (
+                mock.patch("backend.app.services.compress.video_duration", return_value=5.0),
+                mock.patch("backend.app.services.compress.embedded_profile", return_value="v=h264;preset=veryfast;crf=18;h=720;a=copy"),
+                mock.patch("backend.app.services.compress._run_ffmpeg", side_effect=fake_run) as encode,
+            ):
+                result = compress_file(source, dest, CompressConfig(delete_original=False), reuse=True)
+            encode.assert_called_once()
+            self.assertEqual(result.status, "compressed")
+            self.assertEqual(dest.read_bytes(), b"new")
 
 
 class LectureRecordTest(unittest.TestCase):
@@ -244,7 +276,7 @@ class LectureRecordTest(unittest.TestCase):
         self.assertEqual(again.status, "compressed")
         self.assertIn("crf=18", lecture.compressed_profile)
 
-    def test_deletes_original_only_after_success(self) -> None:
+    def test_compress_keeps_original_until_the_caller_finishes(self) -> None:
         lecture, source = self._lecture()
         source.write_bytes(b"original-bytes")
         lecture.video_size = source.stat().st_size
@@ -260,8 +292,39 @@ class LectureRecordTest(unittest.TestCase):
             mock.patch("backend.app.services.compress._ensure_space"),
         ):
             compress_lecture(self.db, lecture, source=source, config=cfg)
-        self.assertFalse(source.exists())
-        self.assertTrue(Path(lecture.compressed_path).is_file())
+        self.assertTrue(source.exists())
+        stored = resolve_stored_path(lecture.compressed_path)
+        self.assertTrue(stored.is_file())
+        self.assertNotEqual(stored.resolve(), source.resolve())
+
+    def test_path_is_relative_to_work_dir(self) -> None:
+        with mock.patch.object(settings, "work_dir", Path(self.tmp.name)):
+            lecture, source = self._lecture("clip.mp4")
+            source.write_bytes(b"original-bytes")
+            lecture.video_size = source.stat().st_size
+            self.db.commit()
+
+            def fake_run(src, partial, config, progress=None, cancel=None):
+                partial.write_bytes(b"compressed-bytes")
+
+            with (
+                mock.patch("backend.app.services.compress.video_duration", return_value=8.0),
+                mock.patch("backend.app.services.compress._run_ffmpeg", side_effect=fake_run),
+                mock.patch("backend.app.services.compress._ensure_space"),
+            ):
+                compress_lecture(
+                    self.db,
+                    lecture,
+                    source=source,
+                    config=CompressConfig(delete_original=False, upload_drive=False),
+                )
+        self.assertFalse(Path(lecture.compressed_path).is_absolute())
+        self.assertTrue(lecture.compressed_path.endswith("clip.compressed.mp4"))
+        with mock.patch.object(settings, "work_dir", Path(self.tmp.name)):
+            found = preferred_upload_source(lecture)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertTrue(found.is_file())
 
     def test_incomplete_download_is_not_compressed(self) -> None:
         lecture, source = self._lecture(size=1000)
@@ -349,6 +412,8 @@ class BackfillTest(unittest.TestCase):
         self.assertEqual(one, (0, 0, 1, 0))
         self.db.refresh(ready)
         self.assertTrue(ready.compressed)
+        self.assertFalse(ready_path.exists())
+        self.assertTrue(resolve_stored_path(ready.compressed_path).is_file())
 
 
 class ReleaseOriginalTest(unittest.TestCase):
@@ -480,6 +545,37 @@ class PipelineHookTest(unittest.TestCase):
         self.assertEqual(called["n"], 0)
         self.assertFalse(video.exists())
 
+    def test_deletes_original_only_after_upload(self) -> None:
+        lecture, video = self._ready_lecture()
+
+        def fake_compress(db, row, **kwargs):
+            self.assertTrue(video.exists())
+            row.compressed = True
+            row.compressed_size = 4
+            row.original_size = video.stat().st_size
+            row.compressed_path = "aula/aula.compressed.mp4"
+            from backend.app.services.compress import CompressResult
+
+            return CompressResult(
+                status="compressed",
+                output=video.with_name("aula.compressed.mp4"),
+                original_size=row.original_size,
+                compressed_size=4,
+            )
+
+        def fake_upload(*_args, **_kwargs):
+            self.assertTrue(video.exists())
+            return "drive-id"
+
+        cfg = CompressConfig(enabled=True, delete_original=True)
+        with (
+            mock.patch("backend.app.services.pipeline.load_compress_config", return_value=cfg),
+            mock.patch("backend.app.services.pipeline.compress_lecture", side_effect=fake_compress),
+            mock.patch.object(drive, "upload_file", side_effect=fake_upload),
+        ):
+            asyncio.run(process_one(self.db, lecture))
+        self.assertFalse(video.exists())
+
 
 class SettingsApiTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -534,6 +630,72 @@ class SettingsApiTest(unittest.TestCase):
         self.assertEqual(body["compress_codec"], "h265")
         self.assertEqual(body["compress_audio_bitrate"], "96k")
         self.assertTrue(body["compress_upload_drive"])
+
+
+def _geometry(path: Path) -> dict[str, str]:
+    text = subprocess.check_output(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,sample_aspect_ratio,display_aspect_ratio",
+            "-of",
+            "default=nw=1",
+            str(path),
+        ],
+        text=True,
+    )
+    data: dict[str, str] = {}
+    for line in text.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            data[key] = value
+    return data
+
+
+class LegacyDatabaseTest(unittest.TestCase):
+    def test_opening_a_session_adds_compress_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.db"
+            legacy = create_engine(f"sqlite:///{path}")
+            Base.metadata.create_all(legacy)
+            seed = sessionmaker(bind=legacy)()
+            seed.add(Lecture(drive_file_id="old", video_filename="old.mp4", status="done"))
+            seed.commit()
+            seed.close()
+            with legacy.begin() as conn:
+                for column in (
+                    "original_size",
+                    "compressed",
+                    "compressed_path",
+                    "compressed_size",
+                    "compressed_profile",
+                    "compressed_drive_file_id",
+                ):
+                    conn.exec_driver_sql(f"ALTER TABLE lectures DROP COLUMN {column}")
+            legacy.dispose()
+
+            from backend.app import db as dbmod
+
+            opened = create_engine(f"sqlite:///{path}", connect_args={"check_same_thread": False})
+            previous = (dbmod.engine, dbmod._Session, dbmod._schema_ready)
+            dbmod.engine = opened
+            dbmod._Session = sessionmaker(bind=opened, autoflush=False, autocommit=False)
+            dbmod._schema_ready = False
+            try:
+                session = dbmod.SessionLocal()
+                row = session.query(Lecture).filter_by(drive_file_id="old").one()
+                self.assertFalse(row.compressed)
+                self.assertEqual(row.compressed_path, "")
+                self.assertEqual(row.compressed_size, 0)
+                self.assertEqual(row.original_size, 0)
+                session.close()
+            finally:
+                dbmod.engine, dbmod._Session, dbmod._schema_ready = previous
+                opened.dispose()
 
 
 class FfmpegIntegrationTest(unittest.TestCase):
@@ -607,6 +769,63 @@ class FfmpegIntegrationTest(unittest.TestCase):
             self.assertIn("v=h265", lecture.compressed_profile)
             self.assertTrue(source.is_file())
             db.close()
+
+    def test_max_height_keeps_aspect_on_a_wide_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "wide.mp4"
+            dest = Path(tmp) / "wide.compressed.mp4"
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc=size=480x220:rate=15",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=44100",
+                    "-t",
+                    "1",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "18",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "96k",
+                    str(source),
+                ],
+                check=True,
+            )
+            compress_file(
+                source,
+                dest,
+                CompressConfig(
+                    max_height=160,
+                    crf=30,
+                    preset="ultrafast",
+                    audio="copy",
+                    duration_tolerance=1,
+                    delete_original=False,
+                ),
+            )
+            geo = _geometry(dest)
+            width = int(geo["width"])
+            height = int(geo["height"])
+            self.assertLess(height, 220)
+            self.assertLessEqual(height, 160)
+            self.assertLess(width, 480)
+            self.assertAlmostEqual(width / height, 480 / 220, delta=0.05)
+            self.assertEqual(geo.get("sample_aspect_ratio"), "1:1")
+            self.assertTrue(source.is_file())
 
 
 if __name__ == "__main__":

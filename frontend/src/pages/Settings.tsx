@@ -394,7 +394,7 @@ function VideoSection({
   const [codec, setCodec] = useState(settings.compress_codec || "h264");
   const [audio, setAudio] = useState(settings.compress_audio || "copy");
   const [bitrate, setBitrate] = useState(settings.compress_audio_bitrate || "128k");
-  const [deleteOriginal, setDeleteOriginal] = useState(Boolean(settings.compress_delete_original));
+  const [deleteOriginal, setDeleteOriginal] = useState(settings.compress_delete_original !== false);
   const [uploadDrive, setUploadDrive] = useState(Boolean(settings.compress_upload_drive));
 
   useEffect(() => {
@@ -405,7 +405,7 @@ function VideoSection({
     setCodec(settings.compress_codec || "h264");
     setAudio(settings.compress_audio || "copy");
     setBitrate(settings.compress_audio_bitrate || "128k");
-    setDeleteOriginal(Boolean(settings.compress_delete_original));
+    setDeleteOriginal(settings.compress_delete_original !== false);
     setUploadDrive(Boolean(settings.compress_upload_drive));
   }, [settings]);
 
@@ -474,7 +474,7 @@ function VideoSection({
         </div>
         <label className="mb-2 flex items-center gap-2 text-xs text-fg">
           <input type="checkbox" checked={deleteOriginal} onChange={(event) => setDeleteOriginal(event.target.checked)} />
-          apagar o original local depois que a duração conferir
+          apagar o original local ao terminar a aula
         </label>
         <label className="mb-3 flex items-center gap-2 text-xs text-fg">
           <input type="checkbox" checked={uploadDrive} onChange={(event) => setUploadDrive(event.target.checked)} />
