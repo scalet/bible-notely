@@ -1,6 +1,10 @@
 # Memória do que foi feito e checklist
 
-Atualizado em 2026-10-20 (noite). O que ainda falta está em [pendencias.md](pendencias.md). O desenho original está em [plan.md](plan.md).
+Atualizado em 2026-11-03. O que ainda falta está em [pendencias.md](pendencias.md). O desenho original está em [plan.md](plan.md).
+
+## O que foi feito em 2026-11-03
+
+- Compressão automática depois da transcrição (`backend/app/services/compress.py`). O original segue para o Whisper; o arquivo `{stem}.compressed.mp4` fica em `work/` e é o que o YouTube envia quando existe. ffprobe confere a duração (tolerância 1s) antes de gravar `compressed`, `compressed_path` (relativo a `work/`), `compressed_size`, `original_size` e `compressed_profile`. O mesmo perfil e um arquivo válido pulam o encode. No fim da aula o original local sai (`COMPRESS_DELETE_ORIGINAL=true`); o Drive continua com a câmera e o comprimido fica. `COMPRESS_MAX_HEIGHT` reduz a altura sem esticar. Ajustes em **Ajustes → Vídeo**. CLI: `compress --max 1` e `compress --id N --fetch`. Colunas novas entram ao abrir o SQLite, não só no CLI. Testes em `tests/test_compress.py`.
 
 ## O que foi feito em 2026-10-20 (noite)
 
@@ -106,7 +110,7 @@ A lista do que falta fica só em [pendencias.md](pendencias.md), para não diver
 ```bash
 cd /home/scalet/Documents/DEV/auto-ebd
 # se precisar recriar: /usr/bin/python3.14 -m venv .venv && .venv/bin/pip install -r requirements.txt
-PYTHONPATH="$PWD" .venv/bin/python -m unittest tests.test_pipeline_rules tests.test_speakers tests.test_size_and_exclusion tests.test_prefetch tests.test_pdf tests.test_logging -q
+PYTHONPATH="$PWD" .venv/bin/python -m unittest tests.test_pipeline_rules tests.test_speakers tests.test_size_and_exclusion tests.test_prefetch tests.test_pdf tests.test_logging tests.test_youtube_classify tests.test_compress -q
 PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli status
 ```
 

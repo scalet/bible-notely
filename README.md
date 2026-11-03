@@ -12,10 +12,11 @@ Repositório: [github.com/scalet/bible-notely](https://github.com/scalet/bible-n
 2. Enfileira MP4s grandes o suficiente (1 GiB ou mais, por padrão).
 3. Baixa o próximo vídeo para `work/`.
 4. Extrai frames e compara o rosto com o cadastro local de palestrantes (OpenCV YuNet + SFace). Match fraco vai para revisão humana.
-5. Transcreve com Whisper (`medium`, português). Enquanto isso, o próximo MP4 já pode começar a baixar.
-6. Pede à LLM só o resumo (Gemini, Grok, Claude ou Copilot). Os versículos vêm da ARC, sem paráfrase.
-7. Gera o PDF, a transcrição `.txt` e a nota do Obsidian.
-8. Envia `.txt` e `.pdf` de volta à pasta do dia e apaga o MP4 local.
+5. Transcreve com Whisper (`medium`, português), no arquivo original. Enquanto isso, o próximo MP4 já pode começar a baixar.
+6. Comprime o MP4 (`libx264`, CRF 23, preset `veryfast`, áudio copiado). A duração precisa conferir com o original. O arquivo comprimido fica em `work/` e é o que o YouTube usa.
+7. Pede à LLM só o resumo (Gemini, Grok, Claude ou Copilot). Os versículos vêm da ARC, sem paráfrase.
+8. Gera o PDF, a transcrição `.txt` e a nota do Obsidian.
+9. Envia `.txt` e `.pdf` de volta à pasta do dia. O MP4 da câmera no Drive não é substituído. No fim da aula a cópia local do original sai; o comprimido fica em `work/`. `COMPRESS_DELETE_ORIGINAL=false` guarda também essa cópia.
 
 A interface (React) serve para cadastrar palestrantes, acompanhar a fila, revisar identificações e conectar o Drive. A API e o pipeline são Python (FastAPI).
 
@@ -127,6 +128,8 @@ PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli cleanup
 PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-auth
 PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-upload --max 1
 PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-sync
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli compress --max 1
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli compress --id 12 --fetch
 ```
 
 Na primeira identificação o programa baixa os modelos de rosto para `data/models/` (cerca de 40 MB). O modelo do Whisper (`medium`) baixa na primeira transcrição.
@@ -155,7 +158,7 @@ PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-auth
 PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-upload --max 1
 ```
 
-Cerca de **6 uploads/dia** por cota padrão da YouTube Data API. MP4s grandes passam pelo disco local (`work/youtube/`).
+Cerca de **6 uploads/dia** por cota padrão da YouTube Data API. MP4s grandes passam pelo disco local (`work/youtube/`). Se a aula já tem arquivo comprimido conferido, o envio usa esse arquivo e não baixa o original de novo.
 
 5. Se precisar reaplicar URLs do state sem reenviar:
 
@@ -173,6 +176,38 @@ PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-sync
 
 Pré-requisitos: YouTube Data API v3 ativa, canal verificado para vídeos longos, mesmo `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` do Drive (escopos `youtube.upload` e `youtube` no login do `youtube-auth` ou no OAuth do Colab).
 
+## Compressão
+
+O passo entra no `cli run` logo depois da transcrição, com a compressão ligada por padrão. Rostos e Whisper continuam no arquivo da câmera. O resultado é `{nome}.compressed.mp4`, na mesma pasta de `work/` da aula, com H.264, `yuv420p` e `-movflags +faststart` para o YouTube e para um arquivo que depois possa ir para o Bunny Stream ou para outro backup.
+
+Antes de gravar a aula como comprimida, o ffprobe precisa ver a mesma duração do original (tolerância `COMPRESS_DURATION_TOLERANCE`, padrão 1 segundo). Saída parcial é descartada; o original fica intacto. Se o arquivo já existe, o tamanho bate e o perfil (codec, CRF, preset, altura, áudio) é o mesmo, o passo é pulado.
+
+O MP4 da câmera no Drive não é trocado. A cópia local do original sai só depois que a aula termina (envio do texto e do PDF, ou parada para revisão) e a compressão já foi conferida. O `{nome}.compressed.mp4` fica. `COMPRESS_DELETE_ORIGINAL=false` guarda a cópia local também. Se o resumo falhar, o original local ainda está lá para a próxima tentativa. `COMPRESS_UPLOAD_DRIVE=true` manda o comprimido para a mesma pasta do dia, sem substituir a câmera. `COMPRESS_MAX_HEIGHT=720` reduz a altura e mantém a proporção (`scale=-2`, pixels quadrados).
+
+Na tela **Ajustes → Vídeo** dá para mudar isso sem editar o `.env`. O que for salvo lá fica em `data/runtime.json` e vale por cima do ambiente.
+
+| Variável | Padrão | Efeito |
+|---|---|---|
+| `COMPRESS_ENABLED` | `true` | liga o passo no `cli run` |
+| `COMPRESS_CRF` | `23` | qualidade; menor fica mais nítido e maior |
+| `COMPRESS_PRESET` | `veryfast` | preset do x264/x265 |
+| `COMPRESS_MAX_HEIGHT` | `0` | `0` mantém o quadro; `720` limita a altura sem esticar |
+| `COMPRESS_CODEC` | `h264` | `h264` ou `h265` |
+| `COMPRESS_AUDIO` | `copy` | `copy` ou `aac` |
+| `COMPRESS_AUDIO_BITRATE` | `128k` | usado quando o áudio é reencodado |
+| `COMPRESS_DELETE_ORIGINAL` | `true` | no fim da aula, apaga o original local; `false` guarda |
+| `COMPRESS_UPLOAD_DRIVE` | `false` | sobe o comprimido para a pasta do dia |
+| `COMPRESS_DURATION_TOLERANCE` | `1` | diferença máxima de duração, em segundos |
+
+Aulas que já saíram do `run` (o MP4 local foi apagado antes desta etapa) entram por:
+
+```bash
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli compress --max 1
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli compress --id 12 --fetch
+```
+
+`--fetch` baixa o original do Drive quando ele não está em `work/`. Sem `--fetch`, só entra aula que já tem o MP4 local. O estado fica em `lectures.compressed_path` (relativo a `work/` quando o arquivo está lá), `compressed_size`, `original_size` e `compressed_profile`. O `cli compress` também apaga o original local no fim, salvo `COMPRESS_DELETE_ORIGINAL=false`.
+
 ## Rotina diária
 
 `deploy/bible-notely.timer` dispara o serviço às 02:00, um vídeo por execução:
@@ -188,5 +223,5 @@ Ajuste `WorkingDirectory` e `ExecStart` no unit para o caminho deste clone. Log 
 ## Testes
 
 ```bash
-PYTHONPATH="$PWD" .venv/bin/python -m unittest tests.test_pipeline_rules tests.test_speakers tests.test_size_and_exclusion tests.test_prefetch tests.test_pdf tests.test_logging tests.test_youtube_classify -q
+PYTHONPATH="$PWD" .venv/bin/python -m unittest tests.test_pipeline_rules tests.test_speakers tests.test_size_and_exclusion tests.test_prefetch tests.test_pdf tests.test_logging tests.test_youtube_classify tests.test_compress -q
 ```

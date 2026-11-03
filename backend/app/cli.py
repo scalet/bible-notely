@@ -17,11 +17,13 @@ from backend.app.services.speakers import import_fotos
 
 def print_status(db) -> None:
     rows = db.query(Lecture.status, func.count(Lecture.id)).group_by(Lecture.status).all()
+    compressed = db.query(func.count(Lecture.id)).filter(Lecture.compressed.is_(True)).scalar() or 0
     print("aulas:")
     if not rows:
         print("  (nenhuma)")
     for status, count in rows:
         print(f"  {status}: {count}")
+    print(f"comprimidos: {compressed}")
     failed = (
         db.query(Lecture)
         .filter(Lecture.status == "failed")
@@ -53,11 +55,18 @@ def main() -> None:
             "youtube-catalog",
             "youtube-upload",
             "youtube-sync",
+            "compress",
         ],
         nargs="?",
         default="run",
     )
-    parser.add_argument("--max", type=int, default=1, help="Vídeos por execução (run / youtube-upload)")
+    parser.add_argument("--max", type=int, default=1, help="Vídeos por execução (run / youtube-upload / compress)")
+    parser.add_argument("--id", type=int, default=0, help="Aula específica (compress)")
+    parser.add_argument(
+        "--fetch",
+        action="store_true",
+        help="Baixa o MP4 do Drive se a cópia local não existir (compress)",
+    )
     args = parser.parse_args()
     setup_logging()
     ensure_schema()
@@ -136,6 +145,33 @@ def main() -> None:
                 print(f"erro: {exc}")
                 return
             print(f"youtube-sync: atualizadas={updated} sem_aula={missing} entradas_state={total}")
+            return
+        if args.command == "compress":
+            from backend.app.services.compress import CompressCancelled, CompressError, compress_backfill
+            from backend.app.services.pipeline import PipelineBusy, pipeline_lock, recover_interrupted
+
+            if pipeline_snapshot().get("running"):
+                print("pipeline em execução; pause ou cancele antes de comprimir")
+                return
+            try:
+                with pipeline_lock():
+                    recover_interrupted(db)
+                    done, skipped, missing, failed = compress_backfill(
+                        db,
+                        lecture_id=args.id or None,
+                        max_items=max(1, args.max),
+                        fetch=args.fetch,
+                    )
+            except PipelineBusy:
+                print("pipeline em execução; pause ou cancele antes de comprimir")
+                return
+            except CompressCancelled:
+                print("compressão cancelada")
+                return
+            except CompressError as exc:
+                print(f"erro: {exc}")
+                return
+            print(f"compress: comprimidos={done} pulados={skipped} sem_arquivo={missing} falhas={failed}")
             return
         processed = asyncio.run(run_batch(db, max_items=args.max))
         print(f"processados={processed}")

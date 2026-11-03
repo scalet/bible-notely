@@ -46,6 +46,18 @@ class Settings(BaseSettings):
     whisper_model: str = "medium"
     whisper_language: str = "pt"
 
+    # Reencode depois da transcrição. O original local sai no fim da aula; false guarda a cópia.
+    compress_enabled: bool = True
+    compress_crf: int = 23
+    compress_preset: str = "veryfast"
+    compress_max_height: int = 0  # 0 mantém a altura
+    compress_codec: str = "h264"  # h264 | h265
+    compress_audio: str = "copy"  # copy | aac
+    compress_audio_bitrate: str = "128k"
+    compress_delete_original: bool = True
+    compress_upload_drive: bool = False
+    compress_duration_tolerance: float = 1.0
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "state.db"
