@@ -61,3 +61,29 @@ class Lecture(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     speaker: Mapped[Speaker | None] = relationship(back_populates="lectures")
+    lyric_pendings: Mapped[list["LyricPending"]] = relationship(back_populates="lecture")
+
+
+class LyricPending(Base):
+    """Música não reconhecida. O prazo evita que a aula fique presa para sempre."""
+
+    __tablename__ = "lyric_pendings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    lecture_id: Mapped[int] = mapped_column(ForeignKey("lectures.id"), index=True)
+    start_seconds: Mapped[float] = mapped_column(Float, default=0)
+    end_seconds: Mapped[float] = mapped_column(Float, default=0)
+    snippet_path: Mapped[str] = mapped_column(String(500), default="")
+    transcript_excerpt: Mapped[str] = mapped_column(Text, default="")
+    signature: Mapped[str] = mapped_column(String(500), default="")
+    region_key: Mapped[str] = mapped_column(String(600), default="")
+    status: Mapped[str] = mapped_column(String(32), default="open", index=True)
+    resolution: Mapped[str] = mapped_column(String(32), default="")
+    hymn_number: Mapped[str] = mapped_column(String(16), default="")
+    title: Mapped[str] = mapped_column(String(300), default="")
+    lyrics: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    lecture: Mapped[Lecture] = relationship(back_populates="lyric_pendings")

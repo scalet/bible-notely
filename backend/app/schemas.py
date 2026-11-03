@@ -92,6 +92,8 @@ class SettingsOut(BaseModel):
     compress_delete_original: bool = True
     compress_upload_drive: bool = False
     compress_duration_tolerance: float = 1.0
+    overlay_enabled: bool = True
+    overlay_wait_hours: float = 24.0
 
 
 class SettingsIn(BaseModel):
@@ -109,6 +111,31 @@ class SettingsIn(BaseModel):
     compress_delete_original: bool | None = None
     compress_upload_drive: bool | None = None
     compress_duration_tolerance: float | None = None
+    overlay_enabled: bool | None = None
+    overlay_wait_hours: float | None = None
+
+
+class LyricPendingOut(BaseModel):
+    id: int
+    lecture_id: int
+    lecture_filename: str = ""
+    start_seconds: float
+    end_seconds: float
+    start_label: str
+    end_label: str
+    transcript_excerpt: str
+    status: str
+    title: str = ""
+    snippet_url: str | None = None
+    created_at: datetime
+    deadline_at: datetime | None = None
+
+
+class LyricResolveIn(BaseModel):
+    action: str
+    query: str = ""
+    lyrics: str = ""
+    title: str = ""
 
 
 class YouTubeFolderOut(BaseModel):

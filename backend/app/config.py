@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     compress_upload_drive: bool = False
     compress_duration_tolerance: float = 1.0
 
+    # Versículos e letras no mesmo encode. 0 horas não espera.
+    overlay_enabled: bool = True
+    overlay_wait_hours: float = 24.0
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "state.db"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import shutil
+from pathlib import Path
 
 from sqlalchemy import func
 
@@ -56,16 +57,29 @@ def main() -> None:
             "youtube-upload",
             "youtube-sync",
             "compress",
+            "overlay",
+            "hymnal",
         ],
         nargs="?",
         default="run",
     )
     parser.add_argument("--max", type=int, default=1, help="Vídeos por execução (run / youtube-upload / compress)")
-    parser.add_argument("--id", type=int, default=0, help="Aula específica (compress)")
+    parser.add_argument("--id", type=int, default=0, help="Aula específica (compress / overlay)")
     parser.add_argument(
         "--fetch",
         action="store_true",
-        help="Baixa o MP4 do Drive se a cópia local não existir (compress)",
+        help="Baixa o MP4 do Drive se a cópia local não existir (compress / overlay)",
+    )
+    parser.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Não espera resposta de letra; o vídeo segue com o que já foi encontrado (overlay)",
+    )
+    parser.add_argument("--path", default="", help="Zip ou pasta do Cantor Cristão (hymnal)")
+    parser.add_argument(
+        "--drive",
+        action="store_true",
+        help="Baixa Cantor_Cristão.zip da pasta Igreja no Drive (hymnal)",
     )
     args = parser.parse_args()
     setup_logging()
@@ -145,6 +159,56 @@ def main() -> None:
                 print(f"erro: {exc}")
                 return
             print(f"youtube-sync: atualizadas={updated} sem_aula={missing} entradas_state={total}")
+            return
+        if args.command == "hymnal":
+            from backend.app.services.hymnal import HymnalError, hymnal_dir, import_hymnal, import_hymnal_from_drive
+
+            try:
+                if args.drive:
+                    count, dest = import_hymnal_from_drive()
+                elif args.path:
+                    count = import_hymnal(Path(args.path))
+                    dest = hymnal_dir()
+                else:
+                    print("informe --path ou --drive")
+                    return
+            except HymnalError as exc:
+                print(f"erro: {exc}")
+                return
+            print(f"hinário indexado: {count} hinos em {dest}")
+            return
+        if args.command == "overlay":
+            from backend.app.services.overlays import OverlayCancelled, OverlayError, run_lecture_overlay
+            from backend.app.services.pipeline import PipelineBusy, pipeline_lock
+
+            if not args.id:
+                print("informe --id da aula")
+                return
+            lecture = db.get(Lecture, args.id)
+            if lecture is None:
+                print(f"erro: aula {args.id} não existe")
+                return
+            if pipeline_snapshot().get("running"):
+                print("pipeline em execução; pause ou cancele antes do overlay")
+                return
+            try:
+                message = run_lecture_overlay(
+                    db,
+                    lecture,
+                    no_wait=args.no_wait,
+                    fetch=args.fetch,
+                    lock=pipeline_lock,
+                )
+            except PipelineBusy:
+                print("pipeline em execução; pause ou cancele antes do overlay")
+                return
+            except OverlayCancelled:
+                print("overlay cancelado")
+                return
+            except OverlayError as exc:
+                print(f"erro: {exc}")
+                return
+            print(f"overlay: {message}")
             return
         if args.command == "compress":
             from backend.app.services.compress import CompressCancelled, CompressError, compress_backfill

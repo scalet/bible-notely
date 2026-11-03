@@ -201,6 +201,24 @@ def profile_of(config: CompressConfig) -> str:
     return f"v={config.codec};preset={config.preset};crf={config.crf};h={config.max_height}{fit};a={audio}"
 
 
+def profile_with_overlay(config: CompressConfig, overlay_token: str = "") -> str:
+    """O perfil da compressão pura não muda. A legenda entra só quando há faixa."""
+    base = profile_of(config)
+    if overlay_token:
+        return f"{base};ov={overlay_token}"
+    return base
+
+
+def _profile_matches(stored: str, config: CompressConfig, overlay_token: str | None) -> bool:
+    base = profile_of(config)
+    if overlay_token is None:
+        # Quem só recomprime não descarta um arquivo que já levou legenda.
+        return stored == base or stored.startswith(f"{base};ov=")
+    if overlay_token:
+        return stored == f"{base};ov={overlay_token}"
+    return stored == base
+
+
 def compressed_output_path(source: Path) -> Path:
     return source.with_name(f"{source.stem}.compressed.mp4")
 
@@ -218,7 +236,37 @@ def scale_filter(max_height: int) -> str | None:
     return f"scale=-2:'min({int(max_height)},ih)',setsar=1"
 
 
-def build_ffmpeg_command(source: Path, dest: Path, config: CompressConfig) -> list[str]:
+def _filter_quote(path: str) -> str:
+    escaped = path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    return f"'{escaped}'"
+
+
+def ass_filter(ass_path: Path) -> str:
+    """Queima o ASS com libass no mesmo -vf da escala. A fonte fica explícita se existir."""
+    filename = _filter_quote(ass_path.resolve().as_posix())
+    fonts = Path("/usr/share/fonts/truetype/dejavu")
+    if fonts.is_dir():
+        return f"ass={filename}:fontsdir={_filter_quote(fonts.as_posix())}"
+    return f"ass={filename}"
+
+
+def compose_video_filter(max_height: int, ass_path: Path | None = None) -> str | None:
+    parts: list[str] = []
+    scale = scale_filter(max_height)
+    if scale:
+        parts.append(scale)
+    if ass_path is not None:
+        parts.append(ass_filter(ass_path))
+    return ",".join(parts) if parts else None
+
+
+def build_ffmpeg_command(
+    source: Path,
+    dest: Path,
+    config: CompressConfig,
+    ass_path: Path | None = None,
+    overlay_token: str = "",
+) -> list[str]:
     config = validate_config(config)
     cmd = [
         "ffmpeg",
@@ -238,7 +286,7 @@ def build_ffmpeg_command(source: Path, dest: Path, config: CompressConfig) -> li
         "-pix_fmt",
         "yuv420p",
     ]
-    vf = scale_filter(config.max_height)
+    vf = compose_video_filter(config.max_height, ass_path)
     if vf:
         cmd += ["-vf", vf]
     if config.codec == "h265":
@@ -249,7 +297,7 @@ def build_ffmpeg_command(source: Path, dest: Path, config: CompressConfig) -> li
         cmd += ["-c:a", "copy"]
     cmd += [
         "-metadata",
-        f"comment={_PROFILE_PREFIX}{profile_of(config)}",
+        f"comment={_PROFILE_PREFIX}{profile_with_overlay(config, overlay_token)}",
         "-movflags",
         "+faststart",
         "-progress",
@@ -278,8 +326,10 @@ def _run_ffmpeg(
     config: CompressConfig,
     progress: Callable[[float], None] | None = None,
     cancel: Event | None = None,
+    ass_path: Path | None = None,
+    overlay_token: str = "",
 ) -> None:
-    cmd = build_ffmpeg_command(source, dest, config)
+    cmd = build_ffmpeg_command(source, dest, config, ass_path=ass_path, overlay_token=overlay_token)
     log.info("ffmpeg %s", " ".join(cmd))
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -400,10 +450,15 @@ def resolve_stored_path(stored: str) -> Path:
     return (settings.work_dir / path).resolve()
 
 
-def _record_matches(lecture: Lecture, dest: Path, config: CompressConfig) -> bool:
+def _record_matches(
+    lecture: Lecture,
+    dest: Path,
+    config: CompressConfig,
+    overlay_token: str | None = None,
+) -> bool:
     if not lecture.compressed:
         return False
-    if (lecture.compressed_profile or "") != profile_of(config):
+    if not _profile_matches(lecture.compressed_profile or "", config, overlay_token):
         return False
     if lecture.compressed_path and resolve_stored_path(lecture.compressed_path) != dest.resolve():
         return False
@@ -423,6 +478,8 @@ def compress_file(
     cancel: Event | None = None,
     *,
     reuse: bool = False,
+    ass_path: Path | None = None,
+    overlay_token: str = "",
 ) -> CompressResult:
     """Encode para um arquivo ao lado do original. Não apaga a origem.
 
@@ -435,7 +492,7 @@ def compress_file(
     dest = dest or compressed_output_path(source)
     if dest.resolve() == source.resolve():
         raise CompressError("o destino da compressão não pode ser o próprio original")
-    profile = profile_of(config)
+    profile = profile_with_overlay(config, overlay_token)
     if reuse and output_is_valid(source, dest, config, profile=profile):
         log.info("compressão reaproveitada: %s", dest.name)
         return CompressResult(
@@ -449,7 +506,15 @@ def compress_file(
     partial = dest.with_name(f"{dest.stem}.part{dest.suffix}")
     partial.unlink(missing_ok=True)
     try:
-        _run_ffmpeg(source, partial, config, progress, cancel)
+        _run_ffmpeg(
+            source,
+            partial,
+            config,
+            progress,
+            cancel,
+            ass_path=ass_path,
+            overlay_token=overlay_token,
+        )
         ok, reason = durations_match(source, partial, config.duration_tolerance)
         if not ok:
             raise CompressError(reason)
@@ -536,6 +601,8 @@ def compress_lecture(
     progress: Callable[[float], None] | None = None,
     cancel: Event | None = None,
     upload: Callable[[Path, str], str] | None = None,
+    ass_path: Path | None = None,
+    overlay_token: str | None = None,
 ) -> CompressResult:
     """Comprime, confere, grava o SQLite e só então apaga ou envia, se pedido."""
     config = validate_config(config or load_compress_config())
@@ -544,7 +611,7 @@ def compress_lecture(
             raise CompressError("MP4 local incompleto; compressão cancelada para não arquivar um download pela metade")
         source = None
     dest = _dest_for(lecture, source)
-    if dest is not None and _record_matches(lecture, dest, config) and (
+    if dest is not None and _record_matches(lecture, dest, config, overlay_token) and (
         source is None or output_is_valid(source, dest, config, expected_size=lecture.compressed_size or 0)
     ):
         result = CompressResult(
@@ -552,7 +619,7 @@ def compress_lecture(
             output=dest,
             original_size=lecture.original_size or (source.stat().st_size if source and source.is_file() else 0),
             compressed_size=dest.stat().st_size,
-            profile=profile_of(config),
+            profile=lecture.compressed_profile or profile_with_overlay(config, overlay_token or ""),
         )
     elif source is None:
         log.info("sem MP4 local para comprimir: %s", lecture.video_filename)
@@ -560,7 +627,16 @@ def compress_lecture(
     else:
         _ensure_space(source.stat().st_size)
         # O perfil já foi comparado acima; se chegou aqui, o arquivo velho não serve.
-        result = compress_file(source, dest, config, progress, cancel, reuse=False)
+        result = compress_file(
+            source,
+            dest,
+            config,
+            progress,
+            cancel,
+            reuse=False,
+            ass_path=ass_path,
+            overlay_token=overlay_token or "",
+        )
         assert result.output is not None
         lecture.original_size = result.original_size
         lecture.compressed = True
@@ -617,7 +693,7 @@ def _needs_attention(lecture: Lecture, source: Path | None, config: CompressConf
     dest = _dest_for(lecture, source)
     current = (
         dest is not None
-        and _record_matches(lecture, dest, config)
+        and _record_matches(lecture, dest, config, None)
         and (source is None or output_is_valid(source, dest, config, expected_size=lecture.compressed_size or 0))
     )
     if not current:

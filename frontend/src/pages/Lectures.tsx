@@ -8,6 +8,7 @@ const tone: Record<string, string> = {
   pending: "",
   failed: "err",
   needs_review: "warn",
+  awaiting_lyrics: "warn",
   skipped: "err",
   excluded: "",
   downloading: "accent",
@@ -23,6 +24,7 @@ const STATUS_LABEL: Record<string, string> = {
   pending: "na fila",
   failed: "falhou",
   needs_review: "revisar",
+  awaiting_lyrics: "aguardando letra",
   skipped: "ignorada",
   excluded: "excluída",
   downloading: "baixando",
@@ -41,7 +43,11 @@ const FILTERS: { id: string; label: string; match: (lecture: Lecture) => boolean
   {
     id: "attention",
     label: "Atenção",
-    match: (lecture) => lecture.status === "failed" || lecture.status === "needs_review" || Boolean(lecture.warning),
+    match: (lecture) =>
+      lecture.status === "failed" ||
+      lecture.status === "needs_review" ||
+      lecture.status === "awaiting_lyrics" ||
+      Boolean(lecture.warning),
   },
   { id: "pending", label: "Fila", match: (lecture) => lecture.status === "pending" },
   { id: "active", label: "Em curso", match: (lecture) => BUSY.has(lecture.status) },
@@ -285,7 +291,7 @@ function LecturePanel({
   const locked = BUSY.has(lecture.status);
   const canAssign = !locked;
   const canReprocess = lecture.status === "failed" || lecture.status === "needs_review";
-  const canExclude = ["pending", "failed", "needs_review", "skipped"].includes(lecture.status);
+  const canExclude = ["pending", "failed", "needs_review", "skipped", "awaiting_lyrics"].includes(lecture.status);
   const canRestore = lecture.status === "excluded" && lecture.error !== TOO_SMALL;
   const pendingSpeaker = confirm === "speaker" ? (speakers.find((speaker) => speaker.id === Number(newSpeaker)) ?? null) : null;
 

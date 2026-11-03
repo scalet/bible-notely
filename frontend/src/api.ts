@@ -71,6 +71,24 @@ export type Settings = {
   compress_delete_original?: boolean;
   compress_upload_drive?: boolean;
   compress_duration_tolerance?: number;
+  overlay_enabled?: boolean;
+  overlay_wait_hours?: number;
+};
+
+export type LyricPending = {
+  id: number;
+  lecture_id: number;
+  lecture_filename: string;
+  start_seconds: number;
+  end_seconds: number;
+  start_label: string;
+  end_label: string;
+  transcript_excerpt: string;
+  status: string;
+  title: string;
+  snippet_url: string | null;
+  created_at: string;
+  deadline_at: string | null;
 };
 
 export type YouTubeFolder = {
@@ -136,6 +154,8 @@ export const api = {
     compress_delete_original?: boolean;
     compress_upload_drive?: boolean;
     compress_duration_tolerance?: number;
+    overlay_enabled?: boolean;
+    overlay_wait_hours?: number;
   }) =>
     req<Settings>("/api/settings", {
       method: "PUT",
@@ -199,6 +219,13 @@ export const api = {
   continueLecture: (id: number, fromStage?: "transcribe" | "summarize" | "upload") =>
     req<{ ok: boolean }>(`/api/pipeline/continue/${id}${fromStage ? `?from_stage=${fromStage}` : ""}`, {
       method: "POST",
+    }),
+  lyricPendings: () => req<LyricPending[]>("/api/lyrics/pending"),
+  resolveLyric: (id: number, body: { action: "hymn" | "lyrics" | "skip"; query?: string; lyrics?: string; title?: string }) =>
+    req<LyricPending>(`/api/lyrics/${id}/resolve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     }),
   transcript: async (id: number) => {
     const res = await fetch(`/api/lectures/${id}/transcript`);

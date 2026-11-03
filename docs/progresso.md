@@ -2,6 +2,10 @@
 
 Atualizado em 2026-11-03. O que ainda falta está em [pendencias.md](pendencias.md). O desenho original está em [plan.md](plan.md).
 
+## O que foi feito em 2026-11-03 (letras e versículos)
+
+- No mesmo ffmpeg da compressão, o vídeo ganha lower-third com o texto ARC do versículo citado e a letra do cântico (Cantor Cristão ou biblioteca local). Ajustes → Vídeo liga ou desliga e define o prazo (padrão 24 h, 0 não espera). Música desconhecida vira pendência em **Pendências de letras**, com o intervalo e um trecho de ~20 s. A resposta (número ou nome, letra colada, ou seguir sem letra) fica em `data/songs/` e vale na próxima vez. O prazo estourado solta o vídeo. CLI: `hymnal --path` / `hymnal --drive` e `overlay --id N --no-wait`. O hinário não entra no git.
+
 ## O que foi feito em 2026-11-03
 
 - Compressão automática depois da transcrição (`backend/app/services/compress.py`). O original segue para o Whisper; o arquivo `{stem}.compressed.mp4` fica em `work/` e é o que o YouTube envia quando existe. ffprobe confere a duração (tolerância 1s) antes de gravar `compressed`, `compressed_path` (relativo a `work/`), `compressed_size`, `original_size` e `compressed_profile`. O mesmo perfil e um arquivo válido pulam o encode. No fim da aula o original local sai (`COMPRESS_DELETE_ORIGINAL=true`); o Drive continua com a câmera e o comprimido fica. `COMPRESS_MAX_HEIGHT` reduz a altura sem esticar. Ajustes em **Ajustes → Vídeo**. CLI: `compress --max 1` e `compress --id N --fetch`. Colunas novas entram ao abrir o SQLite, não só no CLI. Testes em `tests/test_compress.py`.
