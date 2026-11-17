@@ -53,11 +53,12 @@ def main() -> None:
             "youtube-catalog",
             "youtube-upload",
             "youtube-sync",
+            "publish",
         ],
         nargs="?",
         default="run",
     )
-    parser.add_argument("--max", type=int, default=1, help="Vídeos por execução (run / youtube-upload)")
+    parser.add_argument("--max", type=int, default=1, help="Vídeos por execução (run / youtube-upload / publish)")
     args = parser.parse_args()
     setup_logging()
     ensure_schema()
@@ -136,6 +137,16 @@ def main() -> None:
                 print(f"erro: {exc}")
                 return
             print(f"youtube-sync: atualizadas={updated} sem_aula={missing} entradas_state={total}")
+            return
+        if args.command == "publish":
+            from backend.app.services.publish import PublishError, publish_pending
+
+            try:
+                sent, lessons, skipped, failed = publish_pending(db, max_items=max(1, args.max))
+            except PublishError as exc:
+                print(f"erro: {exc}")
+                return
+            print(f"publish: enviados={sent} aulas={lessons} pulados={skipped} falhas={failed}")
             return
         processed = asyncio.run(run_batch(db, max_items=args.max))
         print(f"processados={processed}")

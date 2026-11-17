@@ -39,6 +39,12 @@ def ensure_schema() -> None:
         "youtube_url": "TEXT NOT NULL DEFAULT ''",
         "youtube_title": "TEXT NOT NULL DEFAULT ''",
         "youtube_uploaded_at": "DATETIME",
+        "bunny_video_id": "TEXT NOT NULL DEFAULT ''",
+        "bunny_sha256": "TEXT NOT NULL DEFAULT ''",
+        "bunny_uploaded_at": "DATETIME",
+        "mana_lesson_id": "TEXT NOT NULL DEFAULT ''",
+        "publish_status": "TEXT NOT NULL DEFAULT ''",
+        "publish_error": "TEXT NOT NULL DEFAULT ''",
     }
     with engine.begin() as conn:
         rows = conn.exec_driver_sql("PRAGMA table_info(lectures)").fetchall()
