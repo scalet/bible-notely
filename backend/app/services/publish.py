@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import time
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -154,9 +155,9 @@ def find_processed_video(lecture: Lecture) -> Path | None:
 
 
 def lesson_type_for(lecture: Lecture) -> str:
-    """ebd antes das 10h; culto da manhã e da noite viram culto."""
+    """Valor de Lesson.type no Maná: ebd antes das 10h; culto da manhã e da noite são service."""
     playlist = classify_playlist(resolve_event_time(lecture.video_filename or ""))
-    return "ebd" if playlist == PLAYLIST_EBD else "culto"
+    return "ebd" if playlist == PLAYLIST_EBD else "service"
 
 
 def lesson_verses(summary: dict) -> list[str]:
@@ -195,6 +196,59 @@ def lesson_body(summary: dict) -> str:
     return "\n".join(parts).strip()
 
 
+# A API do Maná (PR #3) só autentica sessão Google. Não há token de script nem conta de serviço.
+MACHINE_AUTH_MISSING = (
+    "O Maná não autentica um script: as rotas de admin exigem sessão Google de uma pessoa. "
+    "A aula não foi enviada. Veja docs/mana-publish.md."
+)
+
+
+def reject_unless_draft(payload: dict) -> None:
+    """O corpo segue LessonInput. Este cliente nunca pede status published."""
+    if payload.get("status") != LESSON_DRAFT:
+        raise PublishError("recusa de envio: status diferente de draft")
+    if payload.get("type") not in {"ebd", "service", "other"}:
+        raise PublishError(f"tipo de aula inválido: {payload.get('type')}")
+
+
+def normalize_person(name: str) -> str:
+    folded = "".join(
+        char for char in unicodedata.normalize("NFD", name or "") if unicodedata.category(char) != "Mn"
+    )
+    return " ".join(folded.lower().split())
+
+
+def speaker_map() -> dict[str, str]:
+    """nome normalizado → speaker_id. O arquivo local entra primeiro; MANA_SPEAKER_MAP cobre por cima."""
+    found: dict[str, str] = {}
+
+    def _take(data: object) -> None:
+        if not isinstance(data, dict):
+            raise PublishError("mapa de palestrantes deve ser um objeto nome → speaker_id")
+        for key, value in data.items():
+            speaker_id = str(value or "").strip()
+            if speaker_id:
+                found[normalize_person(str(key))] = speaker_id
+
+    path = settings.publish_speakers_path
+    if path.exists():
+        try:
+            _take(json.loads(path.read_text(encoding="utf-8")))
+        except json.JSONDecodeError as exc:
+            raise PublishError(f"{path.name} não é JSON") from exc
+    raw = settings.mana_speaker_map.strip()
+    if raw:
+        try:
+            _take(json.loads(raw))
+        except json.JSONDecodeError as exc:
+            raise PublishError("MANA_SPEAKER_MAP não é JSON") from exc
+    return found
+
+
+def speaker_id_from_map(name: str) -> str | None:
+    return speaker_map().get(normalize_person(name))
+
+
 def build_lesson_payload(
     lecture: Lecture,
     speaker: Speaker | None,
@@ -203,39 +257,30 @@ def build_lesson_payload(
     bunny_video_id: str,
     event_date=None,
 ) -> dict:
-    """Corpo enviado ao Maná. status é sempre draft; o cliente recusa qualquer outro valor."""
+    """LessonInput do Maná. status é sempre draft. speaker_id sai do mapa local, se houver."""
     when = event_date or lecture.lecture_date or parse_path_date(lecture.drive_path or "")
     if when is None:
         raise PublishError("aula sem data")
     title = study_title_from_summary(summary) or "Sem título"
+    speaker_name = (speaker.name.strip() if speaker and speaker.name else "") or "Não identificado"
     payload = {
-        "external_id": lecture.drive_file_id,
         "title": title,
         "date": when.isoformat(),
         "type": lesson_type_for(lecture),
-        "speaker": (speaker.name.strip() if speaker and speaker.name else "") or "Não identificado",
+        "speaker_name": speaker_name,
+        "speaker_id": speaker_id_from_map(speaker_name),
+        "bunny_video_id": (bunny_video_id or "").strip() or None,
         "verses": lesson_verses(summary),
         "body": lesson_body(summary),
-        "bunny_video_id": bunny_video_id,
         "status": LESSON_DRAFT,
     }
-    if payload["status"] != LESSON_DRAFT:
-        raise PublishError("a aula só pode sair como rascunho")
-    if payload["type"] not in {"ebd", "culto"}:
-        raise PublishError(f"tipo de aula inválido: {payload['type']}")
+    reject_unless_draft(payload)
     return payload
 
 
 def lesson_fingerprint(payload: dict) -> str:
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode()).hexdigest()
-
-
-def lesson_endpoint(base_url: str) -> str:
-    root = base_url.strip().rstrip("/")
-    if root.endswith("/api"):
-        return f"{root}/admin/pipeline/lessons"
-    return f"{root}/api/admin/pipeline/lessons"
 
 
 def empty_state() -> dict:
@@ -308,10 +353,108 @@ def require_bunny() -> None:
 
 
 def require_mana() -> None:
-    if not settings.mana_publish_enabled:
-        return
-    if not settings.mana_api_url.strip() or not settings.mana_api_token.strip():
-        raise PublishError("MANA_PUBLISH_ENABLED exige MANA_API_URL e MANA_API_TOKEN")
+    """Não exige token. Sem sessão Google o cliente não chama a API."""
+    return
+
+
+class ManaLessons:
+    """POST/PUT /api/admin/lessons. Authorization é o session_token do Google, não uma API key."""
+
+    def __init__(self, http: httpx.Client, base_url: str, session_token: str) -> None:
+        root = base_url.strip().rstrip("/")
+        if root.endswith("/api"):
+            root = root[: -len("/api")]
+        self.origin = root
+        self.http = http
+        self.token = session_token.strip()
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+    def _data(self, response: httpx.Response, action: str) -> object:
+        if response.status_code >= 400:
+            detail = _redact(response.text, [self.token])
+            raise PublishError(f"Maná recusou ao {action} ({response.status_code}): {detail}")
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise PublishError("Maná não devolveu JSON") from exc
+
+    def get_lesson(self, lesson_id: str) -> dict | None:
+        response = self.http.get(f"{self.origin}/api/admin/lessons/{lesson_id}", headers=self._headers())
+        if response.status_code == 404:
+            return None
+        data = self._data(response, "ler a aula")
+        if not isinstance(data, dict):
+            raise PublishError("Maná devolveu uma aula inválida")
+        return data
+
+    def list_speakers(self) -> list[dict]:
+        response = self.http.get(f"{self.origin}/api/admin/speakers", headers=self._headers())
+        data = self._data(response, "listar palestrantes")
+        if not isinstance(data, list):
+            raise PublishError("Maná devolveu palestrantes inválidos")
+        return [row for row in data if isinstance(row, dict)]
+
+    def create_lesson(self, payload: dict) -> dict:
+        reject_unless_draft(payload)
+        if not str(payload.get("speaker_id") or "").strip():
+            raise PublishError("speaker_id obrigatório")
+        response = self.http.post(f"{self.origin}/api/admin/lessons", headers=self._headers(), json=payload)
+        return self._lesson(self._data(response, "criar a aula"))
+
+    def update_lesson(self, lesson_id: str, payload: dict) -> dict:
+        reject_unless_draft(payload)
+        if not str(payload.get("speaker_id") or "").strip():
+            raise PublishError("speaker_id obrigatório")
+        response = self.http.put(
+            f"{self.origin}/api/admin/lessons/{lesson_id}",
+            headers=self._headers(),
+            json=payload,
+        )
+        return self._lesson(self._data(response, "atualizar a aula"))
+
+    def _lesson(self, data: object) -> dict:
+        if not isinstance(data, dict) or not str(data.get("lesson_id") or "").strip():
+            raise PublishError("Maná não devolveu lesson_id")
+        return data
+
+
+def resolve_speaker_id(name: str, mana: ManaLessons | None) -> str:
+    """Mapa local primeiro. Sem ele, GET /api/admin/speakers e o nome, sem acento e sem maiúsculas."""
+    mapped = speaker_id_from_map(name)
+    if mapped:
+        return mapped
+    if mana is None:
+        raise PublishError(f"sem speaker_id para {name}; preencha data/publish/speakers.json")
+    wanted = normalize_person(name)
+    found: list[str] = []
+    for row in mana.list_speakers():
+        if normalize_person(str(row.get("name") or "")) != wanted:
+            continue
+        speaker_id = str(row.get("speaker_id") or "").strip()
+        if speaker_id and speaker_id not in found:
+            found.append(speaker_id)
+    if len(found) == 1:
+        return found[0]
+    if len(found) > 1:
+        raise PublishError(f"mais de um palestrante no Maná com o nome {name}")
+    raise PublishError(f"sem speaker_id para {name}; cadastre o palestrante no Maná ou em speakers.json")
+
+
+def _lock_published(db: Session, lecture: Lecture, state: dict, entry: dict, lesson_id: str) -> PublishResult:
+    """Aula já publicada por uma pessoa: nenhuma escrita daqui para a frente."""
+    entry["mana_lesson_id"] = lesson_id
+    entry["lesson_status"] = "published"
+    entry["status"] = "skipped_published"
+    entry["error"] = ""
+    _persist(db, lecture, state, entry)
+    log.info("aula %s publicada; sincronização não altera", lesson_id)
+    return PublishResult("skipped", str(entry.get("bunny_video_id") or ""), lesson_id, "aula publicada; não alterada")
 
 
 class BunnyStream:
@@ -486,49 +629,6 @@ class BunnyStream:
             sleep(interval)
 
 
-class ManaLessons:
-    """Cliente do contrato em docs/mana-publish.md. Só envia status=draft."""
-
-    def __init__(self, http: httpx.Client, base_url: str, token: str) -> None:
-        self.http = http
-        self.url = lesson_endpoint(base_url)
-        self.token = token.strip()
-
-    def upsert_draft(self, payload: dict) -> dict:
-        if payload.get("status") != LESSON_DRAFT:
-            raise PublishError("recusa de envio: status diferente de draft")
-        response = self.http.put(
-            self.url,
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-        if response.status_code >= 400 and response.status_code != 409:
-            detail = _redact(response.text, [self.token])
-            raise PublishError(f"Maná recusou a aula ({response.status_code}): {detail}")
-        try:
-            body = response.json()
-        except ValueError as exc:
-            raise PublishError("Maná não devolveu JSON") from exc
-        if not isinstance(body, dict):
-            raise PublishError("Maná devolveu um JSON que não é objeto")
-        if response.status_code == 409 and not body.get("lesson_id"):
-            raise PublishError("Maná recusou atualizar a aula (409)")
-        created = response.status_code == 201
-        if "created" in body:
-            created = bool(body["created"])
-        status = str(body.get("status") or "")
-        lesson_id = str(body.get("lesson_id") or "")
-        if not lesson_id:
-            raise PublishError("Maná não devolveu lesson_id")
-        if status not in {LESSON_DRAFT, "published"}:
-            raise PublishError(f"situação inesperada da aula: {status or 'vazia'}")
-        return {"lesson_id": lesson_id, "status": status, "created": created, "bunny_video_id": body.get("bunny_video_id") or payload["bunny_video_id"]}
-
-
 def _entry_for(lecture: Lecture, state: dict) -> dict:
     raw = (state.get("uploads") or {}).get(lecture.drive_file_id) or {}
     entry = dict(raw) if isinstance(raw, dict) else {}
@@ -687,64 +787,77 @@ def publish_lecture(
             entry["error"] = ""
             _persist(db, lecture, state, entry)
 
-        draft["bunny_video_id"] = video_id
-        fingerprint = lesson_fingerprint(draft)
+        draft["bunny_video_id"] = video_id or None
+        mapped = speaker_id_from_map(str(draft.get("speaker_name") or ""))
+        if mapped:
+            draft["speaker_id"] = mapped
+        reject_unless_draft(draft)
+        action = "uploaded" if uploaded_now else "skipped"
         if not settings.mana_publish_enabled:
             detail = "MANA_PUBLISH_ENABLED desligado; aula não enviada"
+            entry["lesson_payload"] = draft
             entry["status"] = "bunny_ready"
-            entry["lesson_fingerprint"] = ""
+            entry["error"] = ""
             _persist(db, lecture, state, entry)
-            action = "uploaded" if uploaded_now else "skipped"
             log.info("Bunny %s pronto (%s); %s", video_id, lecture.video_filename, detail)
             return PublishResult(action, video_id, str(entry.get("mana_lesson_id") or ""), detail)
 
-        if (
-            not uploaded_now
-            and entry.get("mana_lesson_id")
-            and entry.get("lesson_fingerprint") == fingerprint
-            and not entry.get("refused_auto_publish")
-        ):
-            return PublishResult("skipped", video_id, str(entry["mana_lesson_id"]), "aula já sincronizada")
+        session = settings.mana_session_token.strip()
+        if not session or not settings.mana_api_url.strip():
+            entry["lesson_payload"] = draft
+            entry["status"] = "bunny_ready"
+            entry["error"] = MACHINE_AUTH_MISSING
+            _persist(db, lecture, state, entry)
+            log.info("Bunny %s pronto (%s); %s", video_id, lecture.video_filename, MACHINE_AUTH_MISSING)
+            return PublishResult(action, video_id, str(entry.get("mana_lesson_id") or ""), MACHINE_AUTH_MISSING)
 
-        mana = ManaLessons(client, settings.mana_api_url, settings.mana_api_token)
+        mana = ManaLessons(client, settings.mana_api_url, session)
+        lesson_id = str(entry.get("mana_lesson_id") or "")
+        current: dict | None = None
+        if lesson_id:
+            try:
+                current = mana.get_lesson(lesson_id)
+            except PublishError as exc:
+                _fail(db, lecture, state, entry, str(exc))
+            if current and str(current.get("status") or "") == "published":
+                return _lock_published(db, lecture, state, entry, lesson_id)
+            if current is None:
+                lesson_id = ""
+
+        if not str(draft.get("speaker_id") or "").strip():
+            try:
+                draft["speaker_id"] = resolve_speaker_id(str(draft.get("speaker_name") or ""), mana)
+            except PublishError as exc:
+                _fail(db, lecture, state, entry, str(exc))
+        reject_unless_draft(draft)
+        entry["lesson_payload"] = draft
+        entry["lesson_fingerprint"] = lesson_fingerprint(draft)
+
+        wire = dict(draft)
+        youtube_id = str((current or {}).get("youtube_video_id") or "").strip()
+        if youtube_id:
+            wire["youtube_url"] = f"https://www.youtube.com/watch?v={youtube_id}"
         try:
-            body = mana.upsert_draft(draft)
+            if lesson_id:
+                saved = mana.update_lesson(lesson_id, wire)
+            else:
+                saved = mana.create_lesson(wire)
         except PublishError as exc:
             _fail(db, lecture, state, entry, str(exc))
-        created = bool(body["created"])
-        lesson_status = str(body["status"])
-        if created and lesson_status != LESSON_DRAFT:
-            entry["refused_auto_publish"] = True
-            _fail(
-                db,
-                lecture,
-                state,
-                entry,
-                "a API criou a aula fora de rascunho; publicação automática recusada",
-            )
-        if lesson_status == "published" and entry.get("refused_auto_publish"):
-            _fail(
-                db,
-                lecture,
-                state,
-                entry,
-                "a aula criada pelo pipeline foi publicada pela API; o vínculo não foi aceito",
-            )
-        entry["mana_lesson_id"] = body["lesson_id"]
-        entry["lesson_status"] = lesson_status
-        entry["lesson_fingerprint"] = fingerprint
+        saved_id = str(saved.get("lesson_id") or "")
+        saved_status = str(saved.get("status") or "")
+        if saved_status == "published":
+            return _lock_published(db, lecture, state, entry, saved_id)
+        if saved_status != LESSON_DRAFT:
+            _fail(db, lecture, state, entry, f"situação inesperada da aula: {saved_status or 'vazia'}")
+        entry["mana_lesson_id"] = saved_id
+        entry["lesson_status"] = LESSON_DRAFT
         entry["status"] = "synced"
         entry["error"] = ""
         _persist(db, lecture, state, entry)
-        log.info(
-            "rascunho %s %s para %s (bunny %s)",
-            body["lesson_id"],
-            "criado" if created else "atualizado",
-            lecture.video_filename,
-            video_id,
-        )
-        action = "uploaded" if uploaded_now else "synced"
-        return PublishResult(action, video_id, body["lesson_id"], lesson_status)
+        log.info("rascunho %s gravado para %s (bunny %s)", saved_id, lecture.video_filename, video_id)
+        synced_action = "uploaded" if uploaded_now else "synced"
+        return PublishResult(synced_action, video_id, saved_id, LESSON_DRAFT)
     finally:
         if owns_http:
             client.close()
@@ -755,6 +868,8 @@ def _is_complete(lecture: Lecture, entry: dict) -> bool:
         return False
     if int(entry.get("encode_status") or 0) not in ENCODED_STATUSES:
         return False
+    if entry.get("lesson_status") == "published" and entry.get("mana_lesson_id"):
+        return True
     if entry.get("refused_auto_publish"):
         return False
     if not settings.mana_publish_enabled:
@@ -778,7 +893,8 @@ def _settled(lecture: Lecture, entry: dict, source: Path | None) -> bool:
     """True quando não há nada a enviar sem precisar reler o arquivo inteiro."""
     if not _is_complete(lecture, entry):
         return False
-    if settings.mana_publish_enabled:
+    published = entry.get("lesson_status") == "published" and entry.get("mana_lesson_id")
+    if settings.mana_publish_enabled and not published:
         current = _current_fingerprint(lecture, str(entry.get("bunny_video_id") or ""))
         if current != entry.get("lesson_fingerprint"):
             return False

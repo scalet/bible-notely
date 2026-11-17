@@ -179,7 +179,7 @@ Pré-requisitos: YouTube Data API v3 ativa, canal verificado para vídeos longos
 
 Passo opcional no fim do pipeline. Sobe o vídeo já processado (comprimido, com hinos e versículos quando esse arquivo existe) para o [Bunny Stream](https://bunny.net/stream/) por TUS, espera a codificação e, se a flag estiver ligada, cria ou atualiza a aula no Maná Bíblico. A aula sai sempre como **rascunho**. Este passo não publica sozinho e não apaga o MP4 original no Drive. A limpeza do arquivo local, depois do envio do `.txt` e do `.pdf`, continua a mesma de antes.
 
-Desligado por padrão (`PUBLISH_ENABLED=false`). O comando abaixo também exige as chaves do Bunny; a chamada ao Maná só acontece com `MANA_PUBLISH_ENABLED=true`.
+Desligado por padrão (`PUBLISH_ENABLED=false`). O comando abaixo exige as chaves do Bunny. A aula no Maná só é tentada com `MANA_PUBLISH_ENABLED=true` e um `MANA_SESSION_TOKEN` de sessão Google. Sem essa sessão o cliente não chama a API.
 
 ### Qual arquivo sobe
 
@@ -197,7 +197,7 @@ O vínculo arquivo → vídeo fica em `data/publish/state.json` e nas colunas da
 
 ### Aula em rascunho
 
-O cliente manda `status: "draft"` e recusa a resposta se o Maná criar a aula já publicada. O contrato esperado, e o motivo de ele ficar atrás de uma flag, estão em [docs/mana-publish.md](docs/mana-publish.md). A API atual do Maná (aula com YouTube, tipo `service`, sessão Google) não recebe `bunny_video_id`.
+O cliente manda `POST` ou `PUT /api/admin/lessons` com `status: "draft"`, tipo `ebd` ou `service` e `speaker_id` (mapa local ou `GET /api/admin/speakers`). Se a aula já está `published`, a sincronização não grava de novo. O que a API autentica hoje, e a credencial de script que ainda falta, estão em [docs/mana-publish.md](docs/mana-publish.md).
 
 ### Variáveis
 
@@ -209,15 +209,16 @@ No `.env` (veja `.env.example`):
 | `PUBLISH_TRANSCODE_720` | transcodifica para 720p H.264 antes do upload |
 | `BUNNY_STREAM_LIBRARY_ID` | biblioteca do Bunny Stream |
 | `BUNNY_STREAM_API_KEY` | chave da biblioteca (não commitar) |
-| `MANA_PUBLISH_ENABLED` | `true` chama o contrato de rascunho |
+| `MANA_PUBLISH_ENABLED` | `true` tenta gravar o rascunho; continua desligado por padrão |
 | `MANA_API_URL` | origem do Maná, sem barra no fim |
-| `MANA_API_TOKEN` | token de administrador |
+| `MANA_SESSION_TOKEN` | `session_token` do login Google; não é chave de máquina |
+| `MANA_SPEAKER_MAP` | JSON opcional `{"Nome": "speaker_id"}` |
 
 ```bash
 PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli publish --max 1
 ```
 
-Aulas antigas sem vídeo local e sem vínculo são ignoradas. O tipo da aula é `ebd` (gravação antes das 10h) ou `culto` (manhã e noite). Título, data, palestrante, versículos e texto vêm do resumo já gerado.
+Aulas antigas sem vídeo local e sem vínculo são ignoradas. O tipo da aula é `ebd` (gravação antes das 10h) ou `service` (culto da manhã e da noite, o valor que o Maná grava). Título, data, palestrante, versículos e texto vêm do resumo já gerado. Uma aula que uma pessoa já publicou não é alterada.
 
 ## Rotina diária
 

@@ -59,8 +59,11 @@ class Settings(BaseSettings):
     bunny_tus_endpoint: str = "https://video.bunnycdn.com/tusupload"
 
     mana_api_url: str = ""
-    mana_api_token: str = ""
-    # A API atual do Maná não recebe bunny_video_id. O cliente só chama o contrato novo com esta flag.
+    # session_token emitido por POST /api/auth/session. Não é token de máquina.
+    mana_session_token: str = ""
+    # JSON opcional: {"Nome do palestrante": "speaker_id"}. Também vale data/publish/speakers.json.
+    mana_speaker_map: str = ""
+    # Desligado: não chama o Maná. Ligado ainda exige sessão Google; ver docs/mana-publish.md.
     mana_publish_enabled: bool = False
 
     @property
@@ -110,6 +113,10 @@ class Settings(BaseSettings):
     @property
     def publish_state_path(self) -> Path:
         return self.publish_dir / "state.json"
+
+    @property
+    def publish_speakers_path(self) -> Path:
+        return self.publish_dir / "speakers.json"
 
     @property
     def publish_work_dir(self) -> Path:

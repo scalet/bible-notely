@@ -16,14 +16,13 @@ from backend.app.models import Lecture, Speaker
 from backend.app.services import pipeline, publish
 from backend.app.services.publish import (
     LESSON_DRAFT,
-    ManaLessons,
     PublishError,
     build_lesson_payload,
     ffmpeg_720_command,
     find_processed_video,
-    lesson_endpoint,
     publish_lecture,
     publish_pending,
+    reject_unless_draft,
     tus_signature,
 )
 
@@ -66,7 +65,8 @@ class PublishTest(unittest.TestCase):
             "bunny_stream_library_id": settings.bunny_stream_library_id,
             "bunny_stream_api_key": settings.bunny_stream_api_key,
             "mana_api_url": settings.mana_api_url,
-            "mana_api_token": settings.mana_api_token,
+            "mana_session_token": settings.mana_session_token,
+            "mana_speaker_map": settings.mana_speaker_map,
             "mana_publish_enabled": settings.mana_publish_enabled,
         }
         settings.data_dir = self.root / "data"
@@ -79,10 +79,15 @@ class PublishTest(unittest.TestCase):
         settings.bunny_stream_library_id = "99"
         settings.bunny_stream_api_key = "secret-key"
         settings.mana_api_url = "https://mana.example"
-        settings.mana_api_token = "token-1"
+        settings.mana_session_token = "session-abc"
+        settings.mana_speaker_map = ""
         settings.mana_publish_enabled = True
         settings.publish_dir.mkdir(parents=True, exist_ok=True)
         settings.publish_work_dir.mkdir(parents=True, exist_ok=True)
+        settings.publish_speakers_path.write_text(
+            json.dumps({"Gerson": "speaker_gerson"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
         pipeline._duplicate_names = set()
         engine = create_engine("sqlite://")
         Base.metadata.create_all(engine)
@@ -94,7 +99,9 @@ class PublishTest(unittest.TestCase):
         self.uploaded = bytearray()
         self.statuses = [2, 4]
         self.lesson_status = "draft"
-        self.lesson_created = True
+        self.create_status = "draft"
+        self.youtube_video_id = ""
+        self.speakers = [{"speaker_id": "speaker_gerson", "name": "Gerson", "position": "Professor"}]
         self.expected_title = "A fé que opera"
         self.guids = ["guid-1", "guid-2"]
 
@@ -154,36 +161,72 @@ class PublishTest(unittest.TestCase):
             self.assertEqual(request.headers["AuthorizationSignature"], _signature(video_id))
             self.assertEqual(request.headers["Content-Type"], "application/offset+octet-stream")
             return httpx.Response(204, headers={"Upload-Offset": str(new_offset)})
-        if request.method == "GET" and "/videos/" in request.url.path:
+        if request.method == "GET" and "/videos/" in request.url.path and "/api/" not in request.url.path:
             status = self.statuses.pop(0) if self.statuses else 4
             return httpx.Response(200, json={"guid": request.url.path.rsplit("/", 1)[-1], "status": status, "encodeProgress": 100 if status == 4 else 10})
-        if request.method == "PUT" and request.url.path == "/api/admin/pipeline/lessons":
-            self.assertEqual(request.headers["Authorization"], "Bearer token-1")
-            body = json.loads(request.content.decode())
-            self.assertEqual(body["status"], LESSON_DRAFT)
-            self.assertNotEqual(body["status"], "published")
-            self.assertEqual(body["external_id"], "drive-1")
-            self.assertEqual(body["title"], self.expected_title)
-            self.assertEqual(body["date"], "2026-01-04")
-            self.assertIn(body["type"], {"ebd", "culto"})
-            self.assertEqual(body["speaker"], "Gerson")
-            self.assertIn("João 3:16", body["verses"])
-            self.assertIn("Romanos 5:3-5", body["verses"])
-            self.assertIn("Deus amou o mundo", body["body"])
-            self.assertTrue(body["bunny_video_id"])
-            created = self.lesson_created
-            self.lesson_created = False
+        if request.url.path.startswith("/api/"):
+            self.assertEqual(request.headers["Authorization"], "Bearer session-abc")
+        if request.method == "GET" and request.url.path == "/api/admin/speakers":
+            return httpx.Response(200, json=self.speakers)
+        if request.method == "GET" and request.url.path.startswith("/api/admin/lessons/"):
+            lesson_id = request.url.path.rsplit("/", 1)[-1]
             return httpx.Response(
-                201 if created else 200,
+                200,
                 json={
-                    "lesson_id": "aula_1",
-                    "external_id": body["external_id"],
+                    "lesson_id": lesson_id,
+                    "title": "A fé que opera",
+                    "date": "2026-01-04",
+                    "type": "ebd",
+                    "speaker_name": "Gerson",
+                    "speaker_id": "speaker_gerson",
+                    "youtube_video_id": self.youtube_video_id or None,
+                    "bunny_video_id": "guid-1",
+                    "verses": ["João 3:16"],
+                    "body": "texto",
                     "status": self.lesson_status,
-                    "bunny_video_id": body["bunny_video_id"],
-                    "created": created,
                 },
             )
+        if request.method == "POST" and request.url.path == "/api/admin/lessons":
+            body = self._assert_lesson_body(request)
+            return httpx.Response(201, json=self._lesson_json("aula_1", body, self.create_status))
+        if request.method == "PUT" and request.url.path.startswith("/api/admin/lessons/"):
+            lesson_id = request.url.path.rsplit("/", 1)[-1]
+            body = self._assert_lesson_body(request)
+            if self.youtube_video_id:
+                self.assertEqual(body["youtube_url"], f"https://www.youtube.com/watch?v={self.youtube_video_id}")
+            return httpx.Response(200, json=self._lesson_json(lesson_id, body, "draft"))
         return httpx.Response(500, text=f"inesperado {request.method} {request.url}")
+
+    def _assert_lesson_body(self, request: httpx.Request) -> dict:
+        body = json.loads(request.content.decode())
+        self.assertEqual(body["status"], LESSON_DRAFT)
+        self.assertNotIn("external_id", body)
+        self.assertEqual(body["title"], self.expected_title)
+        self.assertEqual(body["date"], "2026-01-04")
+        self.assertIn(body["type"], {"ebd", "service"})
+        self.assertNotEqual(body["type"], "culto")
+        self.assertEqual(body["speaker_name"], "Gerson")
+        self.assertEqual(body["speaker_id"], "speaker_gerson")
+        self.assertIn("João 3:16", body["verses"])
+        self.assertIn("Romanos 5:3-5", body["verses"])
+        self.assertIn("Deus amou o mundo", body["body"])
+        self.assertTrue(body["bunny_video_id"])
+        return body
+
+    def _lesson_json(self, lesson_id: str, body: dict, status: str) -> dict:
+        return {
+            "lesson_id": lesson_id,
+            "title": body["title"],
+            "date": body["date"],
+            "type": body["type"],
+            "speaker_name": body["speaker_name"],
+            "speaker_id": body["speaker_id"],
+            "youtube_video_id": None,
+            "bunny_video_id": body["bunny_video_id"],
+            "verses": body["verses"],
+            "body": body["body"],
+            "status": status,
+        }
 
     def _run(self, lecture: Lecture, **kwargs):
         clock = kwargs.pop("clock", Clock())
@@ -199,22 +242,24 @@ class PublishTest(unittest.TestCase):
         digest = hashlib.sha256(b"99secret-key1700086400guid-1").hexdigest()
         self.assertEqual(tus_signature("99", "secret-key", 1_700_086_400, "guid-1"), digest)
 
-    def test_lesson_url_and_draft_guard(self) -> None:
-        self.assertEqual(lesson_endpoint("https://mana.example"), "https://mana.example/api/admin/pipeline/lessons")
-        self.assertEqual(lesson_endpoint("https://mana.example/api/"), "https://mana.example/api/admin/pipeline/lessons")
+    def test_lesson_payload_matches_admin_lesson(self) -> None:
         lecture = self._lecture()
         payload = build_lesson_payload(lecture, self.speaker, SUMMARY, bunny_video_id="guid-1")
         self.assertEqual(payload["status"], "draft")
         self.assertEqual(payload["type"], "ebd")
+        self.assertEqual(payload["speaker_name"], "Gerson")
+        self.assertEqual(payload["speaker_id"], "speaker_gerson")
+        self.assertNotIn("external_id", payload)
+        self.assertNotIn("youtube_url", payload)
         payload["status"] = "published"
         with self.assertRaises(PublishError):
-            ManaLessons(httpx.Client(transport=httpx.MockTransport(self._handler)), "https://mana.example", "token-1").upsert_draft(payload)
+            reject_unless_draft(payload)
         self.assertEqual(self.calls, [])
 
-    def test_culto_after_noon(self) -> None:
+    def test_culto_is_service(self) -> None:
         lecture = self._lecture("20260104_190000.mp4")
         payload = build_lesson_payload(lecture, self.speaker, SUMMARY, bunny_video_id="guid-1")
-        self.assertEqual(payload["type"], "culto")
+        self.assertEqual(payload["type"], "service")
 
     def test_prefers_overlay_and_keeps_the_file(self) -> None:
         lecture = self._lecture()
@@ -228,8 +273,9 @@ class PublishTest(unittest.TestCase):
         self.assertTrue(overlay.exists())
         self.assertEqual(bytes(self.uploaded), b"overlay!!")
         self.assertGreater(len([item for item in self.calls if item[0] == "PATCH"]), 1)
-        puts = [item for item in self.calls if item[0] == "PUT"]
-        self.assertEqual(len(puts), 1)
+        posts = [url for method, url in self.calls if method == "POST" and url.endswith("/api/admin/lessons")]
+        self.assertEqual(posts, ["https://mana.example/api/admin/lessons"])
+        self.assertFalse(any(method == "PUT" for method, _url in self.calls))
 
     def test_same_file_is_not_uploaded_again(self) -> None:
         lecture = self._lecture()
@@ -263,11 +309,14 @@ class PublishTest(unittest.TestCase):
         lecture.summary_text = json.dumps(data, ensure_ascii=False)
         self.db.commit()
         self.expected_title = "Outro título"
+        self.youtube_video_id = "abcdefghijk"
         result = self._run(lecture)
         self.assertEqual(result.action, "synced")
         self.assertEqual(result.bunny_video_id, "guid-1")
         self.assertNotIn(("POST", "https://video.bunnycdn.com/library/99/videos"), self.calls)
-        self.assertTrue(any(method == "PUT" for method, _url in self.calls))
+        self.assertIn(("GET", "https://mana.example/api/admin/lessons/aula_1"), self.calls)
+        self.assertIn(("PUT", "https://mana.example/api/admin/lessons/aula_1"), self.calls)
+        self.assertFalse(any(method == "POST" and url.endswith("/api/admin/lessons") for method, url in self.calls))
 
     def test_changed_bytes_create_a_new_video_and_keep_the_old_one(self) -> None:
         lecture = self._lecture()
@@ -332,22 +381,72 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(lecture.publish_status, "bunny_ready")
         self.assertEqual(lecture.mana_lesson_id, "")
 
-    def test_auto_publish_is_refused(self) -> None:
+    def test_published_lesson_is_never_modified(self) -> None:
         lecture = self._lecture()
         self._video(lecture)
+        first = self._run(lecture)
+        self.assertEqual(first.lesson_id, "aula_1")
         self.lesson_status = "published"
-        with self.assertRaises(PublishError) as caught:
-            self._run(lecture)
-        self.assertIn("rascunho", str(caught.exception))
-        self.assertEqual(lecture.publish_status, "failed")
-        self.assertEqual(lecture.mana_lesson_id, "")
         self.calls.clear()
         self.statuses = [4]
-        self.lesson_created = False
+        data = json.loads(lecture.summary_text)
+        data["titulo"] = "Título novo que não pode ir para a aula publicada"
+        lecture.summary_text = json.dumps(data, ensure_ascii=False)
+        self.db.commit()
+        self.expected_title = data["titulo"]
+        second = self._run(lecture)
+        self.assertEqual(second.action, "skipped")
+        self.assertIn("publicada", second.detail)
+        self.assertEqual(second.lesson_id, "aula_1")
+        self.assertIn(("GET", "https://mana.example/api/admin/lessons/aula_1"), self.calls)
+        self.assertFalse(any(method in {"PUT", "POST"} and "/api/admin/lessons" in url for method, url in self.calls))
+        self.calls.clear()
+        third = self._run(lecture)
+        self.assertEqual(third.action, "skipped")
+        self.assertFalse(any(method in {"PUT", "POST"} and "/api/admin/lessons" in url for method, url in self.calls))
+
+    def test_create_that_comes_back_published_is_not_written_again(self) -> None:
+        lecture = self._lecture()
+        self._video(lecture)
+        self.create_status = "published"
+        first = self._run(lecture)
+        self.assertEqual(first.action, "skipped")
+        self.assertEqual(first.lesson_id, "aula_1")
         self.lesson_status = "published"
-        with self.assertRaises(PublishError):
+        self.calls.clear()
+        self.statuses = [4]
+        second = self._run(lecture)
+        self.assertEqual(second.action, "skipped")
+        self.assertFalse(any(method == "PUT" for method, _url in self.calls))
+        self.assertFalse(any(method == "POST" and url.endswith("/api/admin/lessons") for method, url in self.calls))
+
+    def test_speaker_id_comes_from_the_api_when_the_map_is_empty(self) -> None:
+        settings.publish_speakers_path.unlink()
+        lecture = self._lecture()
+        self._video(lecture)
+        self._run(lecture)
+        post = next(request for request in self.calls if request[0] == "POST" and request[1].endswith("/api/admin/lessons"))
+        self.assertEqual(post[1], "https://mana.example/api/admin/lessons")
+        self.assertIn(("GET", "https://mana.example/api/admin/speakers"), self.calls)
+
+    def test_missing_speaker_does_not_create_a_lesson(self) -> None:
+        settings.publish_speakers_path.unlink()
+        self.speakers = []
+        lecture = self._lecture()
+        self._video(lecture)
+        with self.assertRaises(PublishError) as caught:
             self._run(lecture)
-        self.assertFalse(any(url.endswith("/videos") and method == "POST" for method, url in self.calls))
+        self.assertIn("speaker_id", str(caught.exception))
+        self.assertFalse(any(url.endswith("/api/admin/lessons") for _method, url in self.calls))
+
+    def test_flag_on_without_session_does_not_call_mana(self) -> None:
+        settings.mana_session_token = ""
+        lecture = self._lecture()
+        self._video(lecture)
+        result = self._run(lecture)
+        self.assertIn("sessão Google", result.detail)
+        self.assertFalse(any("/api/admin/" in url for _method, url in self.calls))
+        self.assertEqual(lecture.mana_lesson_id, "")
 
     def test_missing_video_does_not_call_bunny(self) -> None:
         lecture = self._lecture()
