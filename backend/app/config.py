@@ -46,6 +46,26 @@ class Settings(BaseSettings):
     whisper_model: str = "medium"
     whisper_language: str = "pt"
 
+    # Passo opcional publish. Desligado: o pipeline não fala com o Bunny nem com o Maná.
+    publish_enabled: bool = False
+    publish_transcode_720: bool = False
+    publish_chunk_bytes: int = 8 * 1024 * 1024
+    publish_encode_timeout_seconds: int = 3600
+    publish_encode_poll_seconds: float = 15.0
+
+    bunny_stream_library_id: str = ""
+    bunny_stream_api_key: str = ""
+    bunny_stream_api_base: str = "https://video.bunnycdn.com"
+    bunny_tus_endpoint: str = "https://video.bunnycdn.com/tusupload"
+
+    mana_api_url: str = ""
+    # session_token emitido por POST /api/auth/session. Não é token de máquina.
+    mana_session_token: str = ""
+    # JSON opcional: {"Nome do palestrante": "speaker_id"}. Também vale data/publish/speakers.json.
+    mana_speaker_map: str = ""
+    # Desligado: não chama o Maná. Ligado ainda exige sessão Google; ver docs/mana-publish.md.
+    mana_publish_enabled: bool = False
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "state.db"
@@ -87,6 +107,22 @@ class Settings(BaseSettings):
         return self.work_dir / "youtube"
 
     @property
+    def publish_dir(self) -> Path:
+        return self.data_dir / "publish"
+
+    @property
+    def publish_state_path(self) -> Path:
+        return self.publish_dir / "state.json"
+
+    @property
+    def publish_speakers_path(self) -> Path:
+        return self.publish_dir / "speakers.json"
+
+    @property
+    def publish_work_dir(self) -> Path:
+        return self.work_dir / "publish"
+
+    @property
     def prompt_path(self) -> Path:
         return ROOT / "prompts" / "resumo.txt"
 
@@ -101,6 +137,8 @@ class Settings(BaseSettings):
             self.frames_dir,
             self.youtube_dir,
             self.youtube_work_dir,
+            self.publish_dir,
+            self.publish_work_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
 

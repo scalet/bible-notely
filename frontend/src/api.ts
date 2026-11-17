@@ -35,6 +35,10 @@ export type Lecture = {
   youtube_url?: string;
   youtube_title?: string;
   youtube_uploaded_at?: string | null;
+  bunny_video_id?: string;
+  mana_lesson_id?: string;
+  publish_status?: string;
+  publish_error?: string;
   status: string;
   error: string;
   updated_at: string;

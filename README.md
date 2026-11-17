@@ -16,6 +16,7 @@ Repositório: [github.com/scalet/bible-notely](https://github.com/scalet/bible-n
 6. Pede à LLM só o resumo (Gemini, Grok, Claude ou Copilot). Os versículos vêm da ARC, sem paráfrase.
 7. Gera o PDF, a transcrição `.txt` e a nota do Obsidian.
 8. Envia `.txt` e `.pdf` de volta à pasta do dia e apaga o MP4 local.
+9. Opcional, desligado por padrão: publica o vídeo processado no Bunny Stream e grava um rascunho no Maná Bíblico. O MP4 original no Drive não é apagado.
 
 A interface (React) serve para cadastrar palestrantes, acompanhar a fila, revisar identificações e conectar o Drive. A API e o pipeline são Python (FastAPI).
 
@@ -127,6 +128,7 @@ PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli cleanup
 PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-auth
 PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-upload --max 1
 PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-sync
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli publish --max 1
 ```
 
 Na primeira identificação o programa baixa os modelos de rosto para `data/models/` (cerca de 40 MB). O modelo do Whisper (`medium`) baixa na primeira transcrição.
@@ -173,6 +175,51 @@ PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-sync
 
 Pré-requisitos: YouTube Data API v3 ativa, canal verificado para vídeos longos, mesmo `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` do Drive (escopos `youtube.upload` e `youtube` no login do `youtube-auth` ou no OAuth do Colab).
 
+## Publicar no Maná Bíblico
+
+Passo opcional no fim do pipeline. Sobe o vídeo já processado (comprimido, com hinos e versículos quando esse arquivo existe) para o [Bunny Stream](https://bunny.net/stream/) por TUS, espera a codificação e, se a flag estiver ligada, cria ou atualiza a aula no Maná Bíblico. A aula sai sempre como **rascunho**. Este passo não publica sozinho e não apaga o MP4 original no Drive. A limpeza do arquivo local, depois do envio do `.txt` e do `.pdf`, continua a mesma de antes.
+
+Desligado por padrão (`PUBLISH_ENABLED=false`). O comando abaixo exige as chaves do Bunny. A aula no Maná só é tentada com `MANA_PUBLISH_ENABLED=true` e um `MANA_SESSION_TOKEN` de sessão Google. Sem essa sessão o cliente não chama a API.
+
+### Qual arquivo sobe
+
+Na pasta `work/` da aula, nesta ordem:
+
+1. `{nome}-hinos.mp4`, `{nome}-hymns.mp4`, `{nome}-overlay.mp4`, `{nome}-versiculos.mp4`, `{nome}-processado.mp4` ou `{nome}-comprimido.mp4`
+2. Um único MP4 da pasta cujo nome indique hino, overlay, versículo ou processado
+3. O próprio MP4 da aula, se ainda estiver no disco
+
+`PUBLISH_TRANSCODE_720=true` gera antes uma cópia 720p H.264 em `work/publish/{id-do-drive}-720p.mp4` e é essa cópia que sobe. O arquivo de origem fica. A cópia é reaproveitada na próxima execução, para o mesmo conteúdo não ser enviado de novo.
+
+### Idempotência
+
+O vínculo arquivo → vídeo fica em `data/publish/state.json` e nas colunas da aula (`bunny_video_id`, `bunny_sha256`, `mana_lesson_id`). A chave é o SHA-256 do arquivo enviado. O mesmo arquivo não sobe outra vez. Se a codificação ou a aula falhar no meio, a próxima execução continua o mesmo vídeo no Bunny em vez de criar outro. Um arquivo diferente (outro hash) gera um vídeo novo; o anterior permanece no Bunny.
+
+### Aula em rascunho
+
+O cliente manda `POST` ou `PUT /api/admin/lessons` com `status: "draft"`, tipo `ebd` ou `service` e `speaker_id` (mapa local ou `GET /api/admin/speakers`). Se a aula já está `published`, a sincronização não grava de novo. O que a API autentica hoje, e a credencial de script que ainda falta, estão em [docs/mana-publish.md](docs/mana-publish.md).
+
+### Variáveis
+
+No `.env` (veja `.env.example`):
+
+| Variável | Uso |
+|---|---|
+| `PUBLISH_ENABLED` | `true` inclui o passo no `cli run` |
+| `PUBLISH_TRANSCODE_720` | transcodifica para 720p H.264 antes do upload |
+| `BUNNY_STREAM_LIBRARY_ID` | biblioteca do Bunny Stream |
+| `BUNNY_STREAM_API_KEY` | chave da biblioteca (não commitar) |
+| `MANA_PUBLISH_ENABLED` | `true` tenta gravar o rascunho; continua desligado por padrão |
+| `MANA_API_URL` | origem do Maná, sem barra no fim |
+| `MANA_SESSION_TOKEN` | `session_token` do login Google; não é chave de máquina |
+| `MANA_SPEAKER_MAP` | JSON opcional `{"Nome": "speaker_id"}` |
+
+```bash
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli publish --max 1
+```
+
+Aulas antigas sem vídeo local e sem vínculo são ignoradas. O tipo da aula é `ebd` (gravação antes das 10h) ou `service` (culto da manhã e da noite, o valor que o Maná grava). Título, data, palestrante, versículos e texto vêm do resumo já gerado. Uma aula que uma pessoa já publicou não é alterada.
+
 ## Rotina diária
 
 `deploy/bible-notely.timer` dispara o serviço às 02:00, um vídeo por execução:
@@ -188,5 +235,5 @@ Ajuste `WorkingDirectory` e `ExecStart` no unit para o caminho deste clone. Log 
 ## Testes
 
 ```bash
-PYTHONPATH="$PWD" .venv/bin/python -m unittest tests.test_pipeline_rules tests.test_speakers tests.test_size_and_exclusion tests.test_prefetch tests.test_pdf tests.test_logging tests.test_youtube_classify -q
+PYTHONPATH="$PWD" .venv/bin/python -m unittest tests.test_pipeline_rules tests.test_speakers tests.test_size_and_exclusion tests.test_prefetch tests.test_pdf tests.test_logging tests.test_youtube_classify tests.test_publish -q
 ```

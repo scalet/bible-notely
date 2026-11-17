@@ -169,6 +169,31 @@ def _remove_local_video(lecture: Lecture) -> bool:
     return existed
 
 
+def _release_local_video(db: Session, lecture: Lecture, video_path: Path) -> bool:
+    """Apaga o MP4 local depois do Drive. Não apaga nada no Drive.
+
+    Com PUBLISH_ENABLED, tenta o Bunny antes. Se a publicação falha, o arquivo local fica
+    para o `cli publish` tentar de novo. Devolve True quando o arquivo foi mantido.
+    """
+    if not settings.publish_enabled:
+        video_path.unlink(missing_ok=True)
+        return False
+    from backend.app.services.publish import PublishError, publish_lecture
+
+    set_pipeline(stage="publish", message=f"Publicando {lecture.video_filename}")
+    try:
+        publish_lecture(db, lecture)
+    except PublishError as exc:
+        lecture.publish_status = "failed"
+        lecture.publish_error = str(exc)
+        _touch(lecture)
+        db.commit()
+        log.error("publicação de %s não concluiu: %s", lecture.video_filename, exc)
+        return True
+    video_path.unlink(missing_ok=True)
+    return False
+
+
 def sync_drive_videos(db: Session, *, force: bool = False) -> int:
     """Importa o Drive. Sem force, uma checagem de alterações substitui a varredura se nada mudou."""
     if not force and not drive.should_list():
@@ -255,6 +280,7 @@ STAGE_LABELS = {
     "transcribe": "transcrição (Whisper)",
     "summarize": "geração do resumo/PDF",
     "upload": "envio ao Drive",
+    "publish": "publicação no Bunny Stream",
 }
 DOWNLOAD_ATTEMPTS = 5
 DOWNLOAD_BACKOFF = 15
@@ -404,8 +430,11 @@ async def process_one(
             lecture.status = "done"
             _touch(lecture)
             db.commit()
-            video_path.unlink(missing_ok=True)
-            set_pipeline(stage="done", message=f"Já enviado: {lecture.video_filename}")
+            kept = _release_local_video(db, lecture, video_path)
+            if kept:
+                set_pipeline(stage="publish", message=f"Publicação pendente: {lecture.video_filename}")
+            else:
+                set_pipeline(stage="done", message=f"Já enviado: {lecture.video_filename}")
             return lecture
 
         held_for_review = False
@@ -559,9 +588,12 @@ async def process_one(
         lecture.status = "done"
         _touch(lecture)
         db.commit()
-        video_path.unlink(missing_ok=True)
+        kept = _release_local_video(db, lecture, video_path)
         log.info("PDF da aula mantido em %s", pdf_path)
-        set_pipeline(stage="done", message=f"Concluído: {lecture.video_filename}")
+        if kept:
+            set_pipeline(stage="publish", message=f"Concluído no Drive; publicação pendente: {lecture.video_filename}")
+        else:
+            set_pipeline(stage="done", message=f"Concluído: {lecture.video_filename}")
         return lecture
     except (drive.DriveCancelled, TranscribeCancelled):
         lecture.status = "pending"
