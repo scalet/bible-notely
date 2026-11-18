@@ -17,6 +17,7 @@ Repositório: [github.com/scalet/bible-notely](https://github.com/scalet/bible-n
 7. Pede à LLM só o resumo (Gemini, Grok, Claude ou Copilot). Os versículos vêm da ARC, sem paráfrase.
 8. Gera o PDF, a transcrição `.txt` e a nota do Obsidian.
 9. Envia `.txt` e `.pdf` de volta à pasta do dia. O MP4 da câmera no Drive não é substituído. No fim da aula a cópia local do original sai; o comprimido fica em `work/`. `COMPRESS_DELETE_ORIGINAL=false` guarda também essa cópia.
+10. Opcional, desligado por padrão: publica só a versão reduzida (`{nome}.compressed.mp4`, com hinos e versículos) no Bunny Stream e grava um rascunho no Maná Bíblico. O MP4 original no Drive não é apagado. Um vídeo de cada tipo por dia (EBD, Culto da Manhã, Culto da Noite).
 
 A interface (React) serve para cadastrar palestrantes, acompanhar a fila, revisar identificações e conectar o Drive. A API e o pipeline são Python (FastAPI).
 
@@ -133,6 +134,8 @@ PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli compress --id 12 --fetch
 PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli hymnal --path "/caminho/Cantor_Cristão.zip"
 PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli hymnal --drive
 PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli overlay --id 12 --no-wait
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli publish --max 1
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli publish --dry-run --video arquivo.compressed.mp4 --summary resumo.json
 ```
 
 Na primeira identificação o programa baixa os modelos de rosto para `data/models/` (cerca de 40 MB). O modelo do Whisper (`medium`) baixa na primeira transcrição.
@@ -233,8 +236,24 @@ sudo systemctl enable --now bible-notely.timer
 
 Ajuste `WorkingDirectory` e `ExecStart` no unit para o caminho deste clone. Log em `data/logs/AAAA/MM/DD/bible-notely.log`. Erros vão para `erros.log` no mesmo dia. O arquivo de log não guarda token nem chave.
 
+
+## Publicar no Bunny e no Maná Bíblico
+
+Passo opcional no fim do pipeline (`PUBLISH_ENABLED`). Sobe **somente** a versão reduzida (`{nome}.compressed.mp4`, já com hinos e versículos) para o [Bunny Stream](https://bunny.net/stream/) por TUS, espera a codificação e, se `MANA_PUBLISH_ENABLED=true`, cria ou atualiza a aula no Maná Bíblico como **rascunho**. Este passo não publica a aula sozinho e não apaga o MP4 original no Drive.
+
+O título segue o padrão da biblioteca Bunny, por exemplo `IBQB - EBD - 15/11/26 - Estudo sobre o Milênio` (tipos: EBD, Culto da Manhã, Culto da Noite). O resumo vai na descrição do vídeo e no corpo da aula. Há no máximo um vídeo de cada tipo por dia.
+
+`cli publish --dry-run` mostra título, descrição, biblioteca e o payload da aula, sem chamar a API do Bunny nem a do site.
+
+```bash
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli publish --max 1
+PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli publish --dry-run --video work/aula/aula.compressed.mp4 --summary resumo.json
+```
+
+A autenticação do Maná, hoje, é a sessão Google de 7 dias (`MANA_SESSION_TOKEN`). Sem ela o cliente não chama a API. O pedido de credencial de máquina está em `docs/mana-publish.md`.
+
 ## Testes
 
 ```bash
-PYTHONPATH="$PWD" .venv/bin/python -m unittest tests.test_pipeline_rules tests.test_speakers tests.test_size_and_exclusion tests.test_prefetch tests.test_pdf tests.test_logging tests.test_youtube_classify tests.test_compress -q
+PYTHONPATH="$PWD" .venv/bin/python -m unittest tests.test_pipeline_rules tests.test_speakers tests.test_size_and_exclusion tests.test_prefetch tests.test_pdf tests.test_logging tests.test_youtube_classify tests.test_compress tests.test_publish -q
 ```

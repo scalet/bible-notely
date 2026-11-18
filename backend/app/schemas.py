@@ -56,6 +56,10 @@ class LectureOut(BaseModel):
     youtube_url: str = ""
     youtube_title: str = ""
     youtube_uploaded_at: datetime | None = None
+    bunny_video_id: str = ""
+    mana_lesson_id: str = ""
+    publish_status: str = ""
+    publish_error: str = ""
     status: str
     error: str
     updated_at: datetime

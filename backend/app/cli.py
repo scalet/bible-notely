@@ -59,11 +59,12 @@ def main() -> None:
             "compress",
             "overlay",
             "hymnal",
+            "publish",
         ],
         nargs="?",
         default="run",
     )
-    parser.add_argument("--max", type=int, default=1, help="Vídeos por execução (run / youtube-upload / compress)")
+    parser.add_argument("--max", type=int, default=1, help="Vídeos por execução (run / youtube-upload / compress / publish)")
     parser.add_argument("--id", type=int, default=0, help="Aula específica (compress / overlay)")
     parser.add_argument(
         "--fetch",
@@ -81,6 +82,14 @@ def main() -> None:
         action="store_true",
         help="Baixa Cantor_Cristão.zip da pasta Igreja no Drive (hymnal)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Mostra o que seria enviado ao Bunny/Maná, sem chamar as APIs (publish)",
+    )
+    parser.add_argument("--video", default="", help="MP4 reduzido para publish --dry-run")
+    parser.add_argument("--summary", default="", help="JSON do resumo para publish --dry-run")
+    parser.add_argument("--speaker", default="", help="Nome do palestrante para publish --dry-run")
     args = parser.parse_args()
     setup_logging()
     ensure_schema()
@@ -236,6 +245,25 @@ def main() -> None:
                 print(f"erro: {exc}")
                 return
             print(f"compress: comprimidos={done} pulados={skipped} sem_arquivo={missing} falhas={failed}")
+            return
+        if args.command == "publish":
+            from backend.app.services.publish import PublishError, plan_from_paths, publish_pending, render_plan
+
+            try:
+                if args.dry_run and (args.video or args.summary):
+                    plan = plan_from_paths(Path(args.video), Path(args.summary) if args.summary else None, speaker_name=args.speaker)
+                    print(render_plan(plan))
+                    return
+                sent, lessons, skipped, failed = publish_pending(
+                    db, max_items=max(1, args.max), dry_run=args.dry_run, lecture_id=args.id or None
+                )
+            except PublishError as exc:
+                print(f"erro: {exc}")
+                return
+            if args.dry_run:
+                print(f"publish dry-run: planos={sent} pulados={skipped} falhas={failed}")
+            else:
+                print(f"publish: enviados={sent} aulas={lessons} pulados={skipped} falhas={failed}")
             return
         processed = asyncio.run(run_batch(db, max_items=args.max))
         print(f"processados={processed}")

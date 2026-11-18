@@ -191,6 +191,29 @@ def release_local_original(lecture: Lecture, video_path: Path) -> None:
     discard_camera_copy(video_path, output, keep=False)
 
 
+def _maybe_publish(db: Session, lecture: Lecture) -> bool:
+    """Publica o comprimido no Bunny/Maná. True = ainda pendente (falhou)."""
+    if not settings.publish_enabled:
+        return False
+    from backend.app.services.publish import PublishError, publish_lecture
+
+    try:
+        publish_lecture(db, lecture)
+    except PublishError as exc:
+        log.error("publicação de %s não concluiu: %s", lecture.video_filename, exc)
+        return True
+    return False
+
+
+def _finish_local(db: Session, lecture: Lecture, video_path: Path, *, done_message: str) -> None:
+    pending = _maybe_publish(db, lecture)
+    release_local_original(lecture, video_path)
+    if pending:
+        set_pipeline(stage="publish", message=f"Publicação pendente: {lecture.video_filename}")
+    else:
+        set_pipeline(stage="done", message=done_message)
+
+
 async def _compress_stage(
     db: Session,
     lecture: Lecture,
@@ -473,8 +496,7 @@ async def process_one(
             lecture.status = "done"
             _touch(lecture)
             db.commit()
-            release_local_original(lecture, video_path)
-            set_pipeline(stage="done", message=f"Já enviado: {lecture.video_filename}")
+            _finish_local(db, lecture, video_path, done_message=f"Já enviado: {lecture.video_filename}")
             return lecture
 
         held_for_review = False
@@ -667,9 +689,8 @@ async def process_one(
         lecture.status = "done"
         _touch(lecture)
         db.commit()
-        release_local_original(lecture, video_path)
+        _finish_local(db, lecture, video_path, done_message=f"Concluído: {lecture.video_filename}")
         log.info("PDF da aula mantido em %s", pdf_path)
-        set_pipeline(stage="done", message=f"Concluído: {lecture.video_filename}")
         return lecture
     except (drive.DriveCancelled, TranscribeCancelled, CompressCancelled):
         lecture.status = "pending"

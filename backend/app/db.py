@@ -72,6 +72,12 @@ def _apply_schema(target: Engine) -> None:
         "compressed_size": "INTEGER NOT NULL DEFAULT 0",
         "compressed_profile": "TEXT NOT NULL DEFAULT ''",
         "compressed_drive_file_id": "TEXT NOT NULL DEFAULT ''",
+        "bunny_video_id": "TEXT NOT NULL DEFAULT ''",
+        "bunny_sha256": "TEXT NOT NULL DEFAULT ''",
+        "bunny_uploaded_at": "DATETIME",
+        "mana_lesson_id": "TEXT NOT NULL DEFAULT ''",
+        "publish_status": "TEXT NOT NULL DEFAULT ''",
+        "publish_error": "TEXT NOT NULL DEFAULT ''",
     }
     with target.begin() as conn:
         rows = conn.exec_driver_sql("PRAGMA table_info(lectures)").fetchall()
