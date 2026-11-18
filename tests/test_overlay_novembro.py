@@ -61,21 +61,21 @@ class LyricCleanupTest(unittest.TestCase):
         self.assertNotIn("6 -", joined)
         self.assertNotIn("1..", joined)
         self.assertNotIn("2..", joined)
-        self.assertEqual(cues[0].lines[0], "A NOSSO PAI DO CÉU,")
+        self.assertEqual(cues[0].lines[0], "A nosso Pai do céu,")
         self.assertEqual(cues[0].label, "1ª estrofe")
         self.assertEqual(cues[-1].label, "2ª estrofe")
-        self.assertEqual(cues[-1].lines[0], "LOUVEMOS AO SENHOR,")
+        self.assertEqual(cues[-1].lines[0], "Louvemos ao Senhor,")
 
     def test_cleaning_index_entries_already_imported(self) -> None:
         dirty = ['6 - “GLÓRIA AO SENHOR”\n2..LOUVEMOS AO SENHOR,\nO SANTO REDENTOR,', "•A GRAÇA DE NOSSO SENHOR"]
         cleaned = clean_stanzas(dirty, "6", "Glória ao Senhor")
-        self.assertEqual(cleaned[0], "LOUVEMOS AO SENHOR,\nO SANTO REDENTOR,")
-        self.assertEqual(cleaned[1], "A GRAÇA DE NOSSO SENHOR")
+        self.assertEqual(cleaned[0], "Louvemos ao Senhor,\no santo Redentor,")
+        self.assertEqual(cleaned[1], "A graça de nosso Senhor")
 
     def test_lyric_cues_have_clean_lines_and_a_stanza_label(self) -> None:
         cues = lyric_cues_for_span("Glória ao Senhor", "6", ['6 - “GLÓRIA AO SENHOR”\n2..LOUVEMOS AO SENHOR,'], 10, 20)
         self.assertEqual(len(cues), 1)
-        self.assertEqual(cues[0].lines, ("LOUVEMOS AO SENHOR,",))
+        self.assertEqual(cues[0].lines, ("Louvemos ao Senhor,",))
         self.assertEqual(cues[0].label, "2ª estrofe")
 
 
@@ -162,13 +162,24 @@ class VersePagingTest(unittest.TestCase):
             "Eu neles, e tu em mim, para que eles sejam perfeitos em unidade, e para que o mundo "
             "conheça que tu me enviaste a mim e que tens amado a eles como me tens amado a mim."
         )
+        # Cabe no cartão (2 linhas em pixels); não inventa segunda tela nem reticências.
         cues = verse_cues_for_span("João 17:23", text, 195, 201)
-        self.assertGreaterEqual(len(cues), 2)
+        self.assertEqual(len(cues), 1)
         self.assertTrue(all("…" not in cue.body for cue in cues))
         rebuilt = " ".join(" ".join(cue.lines) for cue in cues)
         self.assertEqual(rebuilt.split(), text.split())
-        for left, right in zip(cues, cues[1:]):
+        long_text = (
+            text + " Porque Deus enviou o seu Filho ao mundo, não para que condenasse o mundo, "
+            "mas para que o mundo fosse salvo por ele; quem crê nele não é condenado."
+        )
+        long_cues = verse_cues_for_span("João 17:23", long_text, 195, 220)
+        self.assertGreaterEqual(len(long_cues), 2)
+        self.assertTrue(all("…" not in cue.body for cue in long_cues))
+        self.assertEqual(" ".join(" ".join(cue.lines) for cue in long_cues).split(), long_text.split())
+        for left, right in zip(long_cues, long_cues[1:]):
             self.assertAlmostEqual(left.end, right.start)
+            last = left.lines[-1].split()[-1] if left.lines else left.body.split()[-1]
+            self.assertNotIn(last.strip(".,;:!?").lower(), {"que", "e", "de", "do", "da", "tu", "para", "com"})
 
 
 class NovemberCardTest(unittest.TestCase):
@@ -204,3 +215,91 @@ class NovemberCardTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetouchTest(unittest.TestCase):
+    def test_uppercase_slides_become_sentence_case(self) -> None:
+        from backend.app.services.hymnal import normal_case
+
+        text = normal_case("A NOSSO PAI DO CÉU,\nTRIBUTA LÁBIO MEU\nGLÓRIA E LOUVOR! O ESPÍRITO SANTO E JESUS CRISTO,\nSENHOR DEUS DO BRASIL")
+        self.assertEqual(
+            text,
+            "A nosso Pai do céu,\ntributa lábio meu\nglória e louvor! O Espírito Santo e Jesus Cristo,\nSenhor Deus do Brasil",
+        )
+        self.assertEqual(normal_case("Já em caixa normal, Senhor."), "Já em caixa normal, Senhor.")
+
+    def test_cues_show_lyrics_in_normal_case(self) -> None:
+        cues = lyric_cues_for_span("Glória ao Senhor", "6", ['6 - “GLÓRIA AO SENHOR”\n1..A NOSSO PAI DO CÉU,\nTRIBUTA LÁBIO MEU'], 0, 10)
+        self.assertEqual(cues[0].lines, ("A nosso Pai do céu,", "tributa lábio meu"))
+
+    def test_long_verse_breaks_on_punctuation_by_pixels(self) -> None:
+        from backend.app.services.overlays import _WEAK_END, split_verse_pages
+
+        text = (
+            "Porque Deus amou o mundo de tal maneira que deu o seu Filho unigênito, para que todo aquele "
+            "que nele crê não pereça, mas tenha a vida eterna. Porque Deus enviou o seu Filho ao mundo, "
+            "não para que condenasse o mundo, mas para que o mundo fosse salvo por ele; quem crê nele não é "
+            "condenado, mas quem não crê já está condenado, porquanto não crê no nome do unigênito Filho de Deus."
+        )
+        pages = split_verse_pages(text, max_lines=3)
+        self.assertGreaterEqual(len(pages), 2)
+        self.assertEqual(" ".join(pages).split(), text.split())
+        for page in pages[:-1]:
+            last = page.split()[-1]
+            self.assertNotIn(last.strip(".,;:!?").lower(), _WEAK_END)
+            self.assertTrue(last.endswith((",", ";", ".", ":", "!", "?")), page)
+
+    def test_short_verse_stays_on_one_screen(self) -> None:
+        from backend.app.services.overlays import split_verse_pages
+
+        self.assertEqual(len(split_verse_pages("Eu sou a ressurreição e a vida.", max_lines=3)), 1)
+
+
+class SlideHymnalTest(unittest.TestCase):
+    HTML = (
+        "<html><head><style>p{}</style></head><body><h1>Slide 1</h1>"
+        "<p>6 - “GLÓRIA AO SENHOR”</p><p>1..A NOSSO PAI DO CÉU,</p><p>TRIBUTA LÁBIO MEU</p>"
+        "<h1>Slide 2</h1><p>6 - “GLÓRIA AO SENHOR”</p><p>2..LOUVEMOS AO SENHOR,</p><p>O SANTO REDENTOR,</p>"
+        "</body></html>"
+    )
+
+    def test_zip_of_pps_is_converted_and_indexed(self) -> None:
+        from unittest import mock
+
+        from backend.app.services import hymnal
+
+        def fake_run(cmd, **kwargs):
+            outdir = Path(cmd[cmd.index("--outdir") + 1])
+            for name in cmd[cmd.index("--outdir") + 2 :]:
+                (outdir / f"{Path(name).stem}.html").write_text(self.HTML, encoding="utf-8")
+            return mock.Mock(returncode=0, stdout="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / "Cantor_Cristão.zip"
+            import zipfile
+
+            with zipfile.ZipFile(archive, "w") as handle:
+                handle.writestr("Cantor Cristão Power Point zip/006 Glória ao Senhor.pps", b"binario")
+            with mock.patch("shutil.which", return_value="/usr/bin/soffice"), mock.patch("subprocess.run", side_effect=fake_run):
+                count = hymnal.import_hymnal(archive, root)
+            self.assertEqual(count, 1)
+            [song] = hymnal.load_hymns(root)
+            self.assertEqual((song.number, song.title), ("6", "Glória ao Senhor"))
+            self.assertEqual(len(song.stanzas), 2)
+            cleaned = clean_stanzas(song.stanzas, song.number, song.title)
+            self.assertEqual(cleaned[0], "A nosso Pai do céu,\ntributa lábio meu")
+            self.assertEqual(cleaned[1], "Louvemos ao Senhor,\no santo Redentor,")
+
+    def test_missing_libreoffice_is_a_clear_error(self) -> None:
+        from unittest import mock
+
+        from backend.app.services import hymnal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "pps"
+            folder.mkdir()
+            (folder / "001 Antífona.pps").write_bytes(b"x")
+            with mock.patch("shutil.which", return_value=None):
+                with self.assertRaises(hymnal.HymnalError):
+                    hymnal.import_hymnal(folder, Path(tmp))

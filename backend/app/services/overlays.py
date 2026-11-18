@@ -181,43 +181,87 @@ def stanza_label(index: int, stanza: str, total: int) -> str:
     return f"{index + 1}ª estrofe"
 
 
-def split_verse_pages(body: str, width: int = 42, max_lines: int = 4) -> list[str]:
-    """Telas equilibradas, quebrando de preferência depois de pontuação. Sem '…'."""
+_WEAK_END = {
+    "que", "e", "o", "a", "os", "as", "de", "do", "da", "dos", "das", "em", "no", "na", "nos", "nas",
+    "para", "por", "com", "como", "se", "um", "uma", "tu", "eu", "me", "te", "lhe", "ao", "aos", "à",
+    "mas", "nem", "ou", "pois", "quando", "onde", "seu", "sua", "meu", "minha", "teu", "tua",
+}
+
+
+def _verse_measure():
+    """Mede pela mesma fonte e largura útil do cartão de versículo (escala 1920)."""
+    from PIL import Image, ImageDraw
+
+    from backend.app.services.overlay_cards import load_font
+
+    draw = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
+    font = load_font(40, italic=True, weight=450)
+    width = 1500 - 2 * 34
+    return (lambda text: draw.textlength(text, font=font)), width
+
+
+def _pixel_lines(words: list[str], measure, width: float) -> int:
+    lines, current = 0, ""
+    for word in words:
+        trial = word if not current else f"{current} {word}"
+        if current and measure(trial) > width:
+            lines += 1
+            current = word
+        else:
+            current = trial
+    return lines + (1 if current else 0)
+
+
+def split_verse_pages(body: str, width: int = 42, max_lines: int = 3, measure=None) -> list[str]:
+    """Telas pela largura real do cartão; corta de preferência em pontuação.
+
+    Nunca termina tela em palavra fraca ('que tu', 'e', 'para') nem deixa sobra curta.
+    """
     words = (body or "").split()
-    lines = wrap_text(body, width)
-    pages = max(1, -(-len(lines) // max_lines))
-    if pages == 1:
-        return [" ".join(words)] if words else []
-    total = sum(len(word) + 1 for word in words)
-    target = total / pages
-    result: list[str] = []
-    current: list[str] = []
-    size = 0
-    for index, word in enumerate(words):
-        current.append(word)
-        size += len(word) + 1
-        remaining_pages = pages - len(result) - 1
-        if remaining_pages <= 0:
-            continue
-        near = size >= target * 0.8
-        punct = word.endswith((",", ";", ":", ".", "!", "?"))
-        if (near and punct) or size >= target * 1.15 or len(wrap_text(" ".join(current), width)) > max_lines:
-            if len(wrap_text(" ".join(current), width)) > max_lines:
-                current.pop()
-                result.append(" ".join(current))
-                current = [word]
-                size = len(word) + 1
-            else:
-                result.append(" ".join(current))
-                current = []
-                size = 0
-    if current:
-        result.append(" ".join(current))
-    return [page for page in result if page]
+    if not words:
+        return []
+    if measure is None:
+        measure, px = _verse_measure()
+    else:
+        px = width
+    if _pixel_lines(words, measure, px) <= max_lines:
+        return [" ".join(words)]
+    pages: list[str] = []
+    start = 0
+    while start < len(words):
+        rest = words[start:]
+        if _pixel_lines(rest, measure, px) <= max_lines:
+            pages.append(" ".join(rest))
+            break
+        remaining = _pixel_lines(rest, measure, px)
+        screens_left = -(-remaining // max_lines)
+        target = len(rest) / screens_left
+        best, best_score = None, None
+        for end in range(1, len(rest)):
+            chunk = rest[:end]
+            if _pixel_lines(chunk, measure, px) > max_lines:
+                break
+            last = chunk[-1]
+            bare = last.strip(".,;:!?»”\"").lower()
+            score = -abs(end - target) * 0.6
+            if last.endswith((".", "!", "?", ";", ":")):
+                score += 8
+            elif last.endswith(","):
+                score += 5
+            if bare in _WEAK_END:
+                score -= 12
+            if len(rest) - end < 4:
+                score -= 10
+            if best_score is None or score > best_score:
+                best, best_score = end, score
+        best = best or 1
+        pages.append(" ".join(rest[:best]))
+        start += best
+    return pages
 
 
 def verse_cues_for_span(title: str, body: str, start: float, end: float, max_lines: int = 4) -> list[Cue]:
-    pages = split_verse_pages(body, 42, max_lines)
+    pages = split_verse_pages(body, max_lines=3)
     if not pages:
         return []
     min_each = 5.0
@@ -595,7 +639,7 @@ def build_plan(
     return OverlayPlan(cues=cues, waiting=False, ass_path=None, token=cue_token(cues), open_count=0, cards=cards)
 
 
-CARD_STYLE = "nov2026-v1"
+CARD_STYLE = "nov2026-v2"
 
 
 def render_cards(cues: list[Cue], folder: Path, size: tuple[int, int]) -> list[OverlayCard]:

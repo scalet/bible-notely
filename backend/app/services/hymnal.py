@@ -1,6 +1,7 @@
 """Cantor Cristão: importação e índice local.
 
-O zip fica na pasta "Igreja" do Drive do usuário, ou num caminho local.
+O zip ou a pasta (hinos em .txt ou slides .pps/.pptx) fica na pasta "Igreja" do Drive
+ou num caminho local. Slides são convertidos com LibreOffice headless.
 O índice vai para data/hymnal e não entra no git (data/ já é ignorado).
 """
 
@@ -10,6 +11,8 @@ import json
 import logging
 import re
 import shutil
+import subprocess
+import tempfile
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -68,6 +71,46 @@ def clean_lyric_line(line: str) -> str:
     return _STROPH_MARK.sub("", (line or "").strip()).strip()
 
 
+_DIVINE = {
+    "deus": "Deus", "senhor": "Senhor", "jesus": "Jesus", "cristo": "Cristo", "pai": "Pai",
+    "espírito": "Espírito", "espirito": "Espírito", "salvador": "Salvador", "redentor": "Redentor",
+    "jeová": "Jeová", "emanuel": "Emanuel", "messias": "Messias", "cordeiro": "Cordeiro",
+    "trindade": "Trindade", "rei": "Rei", "filho": "Filho",
+    "brasil": "Brasil", "israel": "Israel", "sião": "Sião", "jerusalém": "Jerusalém",
+    "belém": "Belém", "calvário": "Calvário", "galileia": "Galileia", "canaã": "Canaã",
+}
+_WORD = re.compile(r"[^\W\d_]+(?:-[^\W\d_]+)*", re.UNICODE)
+
+
+def _mostly_upper(text: str) -> bool:
+    letters = [ch for ch in text if ch.isalpha()]
+    return bool(letters) and sum(ch.isupper() for ch in letters) / len(letters) > 0.8
+
+
+def normal_case(stanza: str) -> str:
+    """MAIÚSCULAS dos slides -> caixa de frase, como no culto de novembro.
+
+    Início da estrofe e depois de . ! ? fica em maiúscula; Deus, Senhor, Jesus,
+    Cristo, Espírito Santo, Pai e nomes próprios conhecidos também.
+    """
+    if not _mostly_upper(stanza):
+        return stanza
+    text = stanza.lower()
+    text = _WORD.sub(lambda m: _DIVINE.get(m.group(0), m.group(0)), text)
+    text = re.sub(r"(Espírito)\s+santo", r"\1 Santo", text)
+    out: list[str] = []
+    capitalize = True
+    for ch in text:
+        if capitalize and ch.isalpha():
+            out.append(ch.upper())
+            capitalize = False
+            continue
+        out.append(ch)
+        if ch in ".!?:":
+            capitalize = True
+    return "".join(out)
+
+
 def clean_stanzas(stanzas: tuple[str, ...] | list[str], number: str = "", title: str = "") -> tuple[str, ...]:
     """Letra só, sem restos de slide (título entre aspas, número, marcador de estrofe)."""
     cleaned: list[str] = []
@@ -80,7 +123,7 @@ def clean_stanzas(stanzas: tuple[str, ...] | list[str], number: str = "", title:
             if line:
                 lines.append(line)
         if lines:
-            cleaned.append("\n".join(lines))
+            cleaned.append(normal_case("\n".join(lines)))
     return tuple(cleaned)
 
 
@@ -162,15 +205,109 @@ def parse_hymn(filename: str, text: str) -> SongText | None:
     return SongText(key=key, number=number, title=title, stanzas=tuple(stanzas), source="cantor")
 
 
+SLIDE_SUFFIXES = {".pps", ".ppt", ".pptx", ".ppsx", ".odp"}
+
+
+def _visible_text(html: str) -> str:
+    """Texto visível do HTML que o LibreOffice gera para cada slide."""
+    from html.parser import HTMLParser
+
+    class _Parser(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.parts: list[str] = []
+            self.skip = 0
+
+        def handle_starttag(self, tag, attrs):
+            if tag in {"style", "script", "head", "title"}:
+                self.skip += 1
+            if tag in {"p", "div", "h1", "h2", "h3", "br", "li", "tr"}:
+                self.parts.append("\n")
+
+        def handle_endtag(self, tag):
+            if tag in {"style", "script", "head", "title"} and self.skip:
+                self.skip -= 1
+
+        def handle_data(self, data):
+            if not self.skip:
+                self.parts.append(data)
+
+    parser = _Parser()
+    parser.feed(html)
+    lines = [" ".join(line.split()) for line in "".join(parser.parts).splitlines()]
+    lines = [line for line in lines if line and not re.fullmatch(r"(?i)slide\s*\d+", line)]
+    return "\n".join(lines).strip() + "\n"
+
+
+def _slides_to_stanza_text(text: str) -> str:
+    """Cada repetição do título do slide abre um bloco: vira linha em branco entre estrofes."""
+    out: list[str] = []
+    for line in text.splitlines():
+        if _SLIDE_TITLE.match(line.strip()):
+            if out and out[-1] != "":
+                out.append("")
+            continue
+        if _STROPH_MARK.match(line.strip()) and re.match(r"^\d", line.strip()) and out and out[-1] != "":
+            out.append("")
+        out.append(line)
+    return "\n".join(out).strip() + "\n"
+
+
+def convert_slides(files: list[Path], dest: Path, batch: int = 25) -> list[Path]:
+    """Converte .pps/.ppt/.pptx com LibreOffice headless e grava um .txt por hino."""
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        raise HymnalError("o hinário veio em slides; instale o LibreOffice (soffice) para converter")
+    dest.mkdir(parents=True, exist_ok=True)
+    html_dir = dest / "_html"
+    html_dir.mkdir(exist_ok=True)
+    written: list[Path] = []
+    with tempfile.TemporaryDirectory(prefix="lo-hymnal-") as profile:
+        for index in range(0, len(files), batch):
+            chunk = files[index : index + batch]
+            cmd = [
+                soffice, "--headless", "--nologo", "--norestore", "--nofirststartwizard",
+                f"-env:UserInstallation=file://{profile}",
+                "--convert-to", "html", "--outdir", str(html_dir), *[str(path) for path in chunk],
+            ]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
+            if result.returncode != 0:
+                log.warning("soffice falhou num lote: %s", (result.stdout or "")[-500:])
+            for path in chunk:
+                html = html_dir / f"{path.stem}.html"
+                if not html.is_file():
+                    log.warning("slide sem conversão: %s", path.name)
+                    continue
+                text = _slides_to_stanza_text(_visible_text(read_text(html)))
+                target = dest / f"{path.stem}.txt"
+                target.write_text(text, encoding="utf-8")
+                written.append(target)
+    shutil.rmtree(html_dir, ignore_errors=True)
+    return written
+
+
+def _usable(path: Path) -> bool:
+    return "__MACOSX" not in path.parts and not path.name.startswith(".")
+
+
 def _iter_text_files(source: Path, scratch: Path) -> list[Path]:
     if source.is_dir():
-        return [path for path in source.rglob("*.txt") if "__MACOSX" not in path.parts and not path.name.startswith(".")]
-    if source.suffix.lower() != ".zip":
-        raise HymnalError("informe um zip ou uma pasta com os hinos em .txt")
-    scratch.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(source) as archive:
-        archive.extractall(scratch)
-    return [path for path in scratch.rglob("*.txt") if "__MACOSX" not in path.parts and not path.name.startswith(".")]
+        root = source
+    elif source.suffix.lower() == ".zip":
+        scratch.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(source) as archive:
+            archive.extractall(scratch)
+        root = scratch
+    else:
+        raise HymnalError("informe um zip ou uma pasta com os hinos (.txt ou slides .pps/.pptx)")
+    texts = [path for path in root.rglob("*.txt") if _usable(path)]
+    slides = [path for path in root.rglob("*") if path.suffix.lower() in SLIDE_SUFFIXES and _usable(path)]
+    have = {path.stem for path in texts}
+    pending = [path for path in sorted(slides) if path.stem not in have]
+    if pending:
+        log.info("convertendo %s slides do hinário com LibreOffice", len(pending))
+        texts += convert_slides(pending, scratch / "_txt")
+    return texts
 
 
 def import_hymnal(source: Path, root: Path | None = None) -> int:

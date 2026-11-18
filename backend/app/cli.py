@@ -75,7 +75,7 @@ def main() -> None:
         action="store_true",
         help="Não espera resposta de letra; o vídeo segue com o que já foi encontrado (overlay)",
     )
-    parser.add_argument("--path", default="", help="Zip ou pasta do Cantor Cristão (hymnal)")
+    parser.add_argument("--path", default="", help="Zip ou pasta do Cantor Cristão, em .txt ou slides .pps/.pptx (hymnal)")
     parser.add_argument(
         "--drive",
         action="store_true",
