@@ -33,6 +33,7 @@ from colab.youtube_lib import (
     classify_playlist,
     parse_path_date,
     resolve_event_time,
+    clean_study_title,
     study_title_from_summary,
 )
 
@@ -181,7 +182,7 @@ def format_publish_date(when) -> str:
 
 def build_publish_title(study_title: str, event_date, kind: str) -> str:
     """Ex.: IBQB - EBD - 15/11/26 - Estudo sobre o Milênio."""
-    theme = " ".join((study_title or "").split()) or "Sem título"
+    theme = clean_study_title(study_title) or "Sem título"
     return f"IBQB - {event_kind_label(kind)} - {format_publish_date(event_date)} - {theme}"
 
 
@@ -194,7 +195,7 @@ def build_publish_description(
 ) -> str:
     """Resumo na descrição do Bunny: cabeçalho + texto-base, pontos, aplicações e conclusão."""
     header = [
-        "Igreja Batista Quadrangular de Brasília (IBQB)",
+        "IBQB",
         f"Tipo: {event_kind_label(kind)}",
         f"Data: {event_date.strftime('%d/%m/%Y') if event_date else '—'}",
     ]

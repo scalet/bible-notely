@@ -14,6 +14,7 @@ from backend.app.config import settings
 from backend.app.db import Base
 from backend.app.models import Lecture, Speaker
 from backend.app.services import pipeline, publish
+from colab.youtube_lib import clean_study_title
 from backend.app.services.publish import (
     LESSON_DRAFT,
     PublishError,
@@ -565,6 +566,34 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(plan.lesson["type"], "service")
         self.assertEqual(plan.lesson["status"], "draft")
         self.assertNotIn("session_token", json.dumps(plan.lesson))
+
+
+
+    def test_theme_drops_other_event_suffix(self) -> None:
+        raw = "Perfeitos em Unidade — EBD e Culto do Dia dos Pais"
+        self.assertEqual(clean_study_title(raw), "Perfeitos em Unidade")
+        self.assertEqual(
+            build_publish_title(raw, date(2026, 8, 9), "culto_manha"),
+            "IBQB - Culto da Manhã - 09/08/26 - Perfeitos em Unidade",
+        )
+        self.assertEqual(
+            clean_study_title("A Luz do Mundo — 30/08/2026 — Palestrante: Roberto"),
+            "A Luz do Mundo",
+        )
+        self.assertEqual(clean_study_title("A fé que opera"), "A fé que opera")
+
+    def test_description_uses_short_church_name(self) -> None:
+        text = build_publish_description(
+            kind="culto_manha",
+            event_date=date(2026, 8, 9),
+            speaker_name="Roberto",
+            summary=SUMMARY,
+        )
+        self.assertTrue(text.startswith("IBQB"))
+        self.assertNotIn("Igreja Batista", text)
+        self.assertNotIn("Quadrangular", text)
+        self.assertIn("Culto da Manhã", text)
+        self.assertIn("Roberto", text)
 
 
 class ReleaseLocalVideoTest(unittest.TestCase):
