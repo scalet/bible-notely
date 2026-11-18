@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+import httpx
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
@@ -20,6 +21,7 @@ from backend.app.services.identify import identify_speaker
 from backend.app.services.obsidian import export_lecture
 from backend.app.services.pdf import build_summary, render_pdf, summary_plaintext
 from backend.app.services.speakers import import_fotos
+from backend.app.services.compress import CompressCancelled, compress_lecture, load_compress_config
 from backend.app.services.transcribe import TranscribeCancelled, extract_frames, transcribe_video
 
 log = logging.getLogger("bible_notely.pipeline")
@@ -169,6 +171,93 @@ def _remove_local_video(lecture: Lecture) -> bool:
     return existed
 
 
+def release_local_original(lecture: Lecture, video_path: Path) -> None:
+    """Tira a cópia local da câmera no fim da aula.
+
+    O original continua no Drive. O comprimido, se houver, fica em work/.
+    Isso só roda quando a aula terminou (enviada, ou parada para revisão):
+    uma falha no resumo ainda encontra o MP4 da câmera. `delete_original`
+    desligado guarda essa cópia também.
+    """
+    from backend.app.services.compress import discard_camera_copy, resolve_stored_path
+
+    try:
+        keep = lecture.compressed and not load_compress_config().delete_original
+    except Exception:
+        keep = False
+    if keep:
+        log.info("original local mantido: %s", video_path.name)
+        return
+    output = resolve_stored_path(lecture.compressed_path) if lecture.compressed_path else None
+    discard_camera_copy(video_path, output, keep=False)
+
+
+def _maybe_publish(db: Session, lecture: Lecture) -> bool:
+    """Publica o comprimido no Bunny/Maná. True = ainda pendente (falhou)."""
+    if not settings.publish_enabled:
+        return False
+    from backend.app.services.publish import PublishError, publish_lecture
+
+    try:
+        publish_lecture(db, lecture)
+    except PublishError as exc:
+        log.error("publicação de %s não concluiu: %s", lecture.video_filename, exc)
+        return True
+    except httpx.HTTPError as exc:
+        log.error("publicação de %s não concluiu: %s", lecture.video_filename, exc)
+        return True
+    return False
+
+
+async def _finish_local(db: Session, lecture: Lecture, video_path: Path, *, done_message: str) -> None:
+    pending = await asyncio.to_thread(_maybe_publish, db, lecture)
+    release_local_original(lecture, video_path)
+    if pending:
+        set_pipeline(stage="publish", message=f"Publicação pendente: {lecture.video_filename}")
+    else:
+        set_pipeline(stage="done", message=done_message)
+
+
+async def _compress_stage(
+    db: Session,
+    lecture: Lecture,
+    video_path: Path,
+    *,
+    ass_path: Path | None = None,
+    overlay_token: str = "",
+    cards: list | None = None,
+) -> None:
+    set_pipeline(stage="compress", progress=0, message=f"Comprimindo {lecture.video_filename}")
+    lecture.status = "compressing"
+    _touch(lecture)
+    db.commit()
+    last = {"pct": -1}
+
+    def _progress(fraction: float) -> None:
+        pct = int(fraction * 100)
+        if pct != last["pct"]:
+            last["pct"] = pct
+            set_pipeline(progress=pct, message=f"Comprimindo {lecture.video_filename}: {pct}%")
+
+    source = video_path if video_path.is_file() else None
+    result = await asyncio.to_thread(
+        compress_lecture,
+        db,
+        lecture,
+        source=source,
+        progress=_progress,
+        cancel=cancel_event,
+        ass_path=ass_path,
+        overlay_token=overlay_token,
+        cards=cards,
+    )
+    set_pipeline(progress=None)
+    if result.status == "missing":
+        log.info("sem MP4 local para comprimir: %s", lecture.video_filename)
+    elif result.status == "skipped":
+        log.info("compressão reaproveitada: %s", result.output)
+
+
 def sync_drive_videos(db: Session, *, force: bool = False) -> int:
     """Importa o Drive. Sem force, uma checagem de alterações substitui a varredura se nada mudou."""
     if not force and not drive.should_list():
@@ -253,6 +342,8 @@ STAGE_LABELS = {
     "download": "download do vídeo",
     "identify": "identificação do palestrante",
     "transcribe": "transcrição (Whisper)",
+    "lyrics": "versículos e letras",
+    "compress": "compressão do vídeo",
     "summarize": "geração do resumo/PDF",
     "upload": "envio ao Drive",
 }
@@ -260,7 +351,7 @@ DOWNLOAD_ATTEMPTS = 5
 DOWNLOAD_BACKOFF = 15
 MAX_CONSECUTIVE_FAILURES = 3
 UNLIMITED = 10**9
-IN_PROGRESS = ("downloading", "identifying", "transcribing", "summarizing", "uploading")
+IN_PROGRESS = ("downloading", "identifying", "transcribing", "compressing", "summarizing", "uploading")
 
 
 def recover_interrupted(db: Session) -> int:
@@ -331,6 +422,11 @@ def next_pending(db: Session, skip_ids: set[int] | None = None) -> Lecture | Non
             query = query.filter(~Lecture.id.in_(skip_ids))
         return query
 
+    from backend.app.services.overlays import lyrics_ready
+
+    for lecture in _query("awaiting_lyrics").order_by(Lecture.lecture_date.desc(), Lecture.id.desc()).all():
+        if lyrics_ready(db, lecture.id):
+            return lecture
     pending = _query("pending").order_by(Lecture.lecture_date.desc(), Lecture.id.desc()).first()
     if pending:
         return pending
@@ -404,8 +500,7 @@ async def process_one(
             lecture.status = "done"
             _touch(lecture)
             db.commit()
-            video_path.unlink(missing_ok=True)
-            set_pipeline(stage="done", message=f"Já enviado: {lecture.video_filename}")
+            await _finish_local(db, lecture, video_path, done_message=f"Já enviado: {lecture.video_filename}")
             return lecture
 
         held_for_review = False
@@ -511,13 +606,52 @@ async def process_one(
         _touch(lecture)
         db.commit()
 
+        try:
+            compress_cfg = load_compress_config()
+        except Exception:
+            set_pipeline(stage="compress", message=f"Ajuste de compressão inválido para {lecture.video_filename}")
+            raise
+        if compress_cfg.enabled:
+            from backend.app.services.overlays import OverlayPlan, build_plan, load_overlay_config
+
+            if load_overlay_config().enabled:
+                set_pipeline(stage="lyrics", progress=None, message=f"Versículos e letras de {lecture.video_filename}")
+                plan = await asyncio.to_thread(
+                    build_plan,
+                    db,
+                    lecture,
+                    transcript,
+                    video_path if video_path.is_file() else None,
+                    no_wait=False,
+                )
+            else:
+                plan = OverlayPlan(cues=[], waiting=False, ass_path=None, token="", open_count=0, cards=[])
+            if plan.waiting:
+                lecture.status = "awaiting_lyrics"
+                _touch(lecture)
+                db.commit()
+                set_pipeline(
+                    stage="lyrics",
+                    message=f"Aguardando letra em {lecture.video_filename}. O prazo está em Ajustes.",
+                )
+                log.info("aula %s aguardando letra (%s pendências)", lecture.id, plan.open_count)
+                return lecture
+            await _compress_stage(
+                db,
+                lecture,
+                video_path,
+                ass_path=plan.ass_path,
+                overlay_token=plan.token,
+                cards=plan.cards or None,
+            )
+
         if held_for_review:
             lecture.status = "needs_review"
             _touch(lecture)
             db.commit()
-            video_path.unlink(missing_ok=True)
+            release_local_original(lecture, video_path)
             set_pipeline(stage="needs_review", message="Aguardando revisão do palestrante")
-            log.info("aula %s em revisão; transcrição salva, MP4 removido", lecture.id)
+            log.info("aula %s em revisão; transcrição salva", lecture.id)
             return lecture
 
         speaker = db.get(Speaker, lecture.speaker_id) if lecture.speaker_id else None
@@ -559,11 +693,10 @@ async def process_one(
         lecture.status = "done"
         _touch(lecture)
         db.commit()
-        video_path.unlink(missing_ok=True)
+        await _finish_local(db, lecture, video_path, done_message=f"Concluído: {lecture.video_filename}")
         log.info("PDF da aula mantido em %s", pdf_path)
-        set_pipeline(stage="done", message=f"Concluído: {lecture.video_filename}")
         return lecture
-    except (drive.DriveCancelled, TranscribeCancelled):
+    except (drive.DriveCancelled, TranscribeCancelled, CompressCancelled):
         lecture.status = "pending"
         lecture.error = ""
         _touch(lecture)
@@ -656,11 +789,18 @@ async def _run_locked(db: Session, max_items: int) -> int:
                     break
             else:
                 failures = 0
-            if lecture.status == "needs_review":
+            if lecture.status in {"needs_review", "awaiting_lyrics"}:
                 continue
             processed += 1
         if processed == 0:
-            set_pipeline(message="Nada novo para processar", stage=None)
+            waiting = db.query(Lecture).filter(Lecture.status == "awaiting_lyrics").count()
+            if waiting:
+                set_pipeline(
+                    message=f"Aguardando letra de {waiting} aula(s). Responda em Pendências de letras ou espere o prazo.",
+                    stage="lyrics",
+                )
+            else:
+                set_pipeline(message="Nada novo para processar", stage=None)
         return processed
     finally:
         leftovers = [task for task in _prefetch.values() if not task.done()]

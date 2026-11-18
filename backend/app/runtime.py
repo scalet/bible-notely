@@ -74,7 +74,14 @@ def set_drive_index(index: dict) -> None:
         _save(data)
 
 
-def update_runtime(**kwargs: str) -> None:
+def runtime_get(key: str, default: object = None) -> object:
+    data = _load()
+    if key not in data or data[key] is None:
+        return default
+    return data[key]
+
+
+def update_runtime(**kwargs: object) -> None:
     with _runtime_lock:
         data = _load()
         data.update({k: v for k, v in kwargs.items() if v is not None})

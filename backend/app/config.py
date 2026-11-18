@@ -46,6 +46,41 @@ class Settings(BaseSettings):
     whisper_model: str = "medium"
     whisper_language: str = "pt"
 
+    # Reencode depois da transcrição. O original local sai no fim da aula; false guarda a cópia.
+    compress_enabled: bool = True
+    compress_crf: int = 23
+    compress_preset: str = "veryfast"
+    compress_max_height: int = 0  # 0 mantém a altura
+    compress_codec: str = "h264"  # h264 | h265
+    compress_audio: str = "copy"  # copy | aac
+    compress_audio_bitrate: str = "128k"
+    compress_delete_original: bool = True
+    compress_upload_drive: bool = False
+    compress_duration_tolerance: float = 1.0
+
+    # Versículos e letras no mesmo encode. 0 horas não espera.
+    overlay_enabled: bool = True
+    overlay_wait_hours: float = 24.0
+
+    # Passo opcional publish. Desligado: o pipeline não fala com o Bunny nem com o Maná.
+    publish_enabled: bool = False
+    publish_transcode_720: bool = False
+    publish_chunk_bytes: int = 8 * 1024 * 1024
+    publish_encode_timeout_seconds: int = 3600
+    publish_encode_poll_seconds: float = 15.0
+    bunny_stream_library_id: str = ""
+    bunny_stream_api_key: str = ""
+    bunny_stream_api_base: str = "https://video.bunnycdn.com"
+    bunny_tus_endpoint: str = "https://video.bunnycdn.com/tusupload"
+    mana_api_url: str = ""
+    mana_session_token: str = ""
+    mana_speaker_map: str = ""
+    # Desligado: não chama o Maná. Ligado ainda exige sessão Google; ver docs/mana-publish.md.
+    mana_publish_enabled: bool = False
+    # Quando o Maná tiver PUT /api/pipeline/lessons/{drive_file_id}, ligue esta flag.
+    mana_pipeline_lessons: bool = False
+    mana_pipeline_token: str = ""
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "state.db"
@@ -87,6 +122,22 @@ class Settings(BaseSettings):
         return self.work_dir / "youtube"
 
     @property
+    def publish_dir(self) -> Path:
+        return self.data_dir / "publish"
+
+    @property
+    def publish_state_path(self) -> Path:
+        return self.publish_dir / "state.json"
+
+    @property
+    def publish_speakers_path(self) -> Path:
+        return self.publish_dir / "speakers.json"
+
+    @property
+    def publish_work_dir(self) -> Path:
+        return self.work_dir / "publish"
+
+    @property
     def prompt_path(self) -> Path:
         return ROOT / "prompts" / "resumo.txt"
 
@@ -101,6 +152,8 @@ class Settings(BaseSettings):
             self.frames_dir,
             self.youtube_dir,
             self.youtube_work_dir,
+            self.publish_dir,
+            self.publish_work_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
 

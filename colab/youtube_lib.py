@@ -87,7 +87,7 @@ def format_date_br(d: date | None) -> str:
 
 def build_youtube_title(study_title: str, event_date: date | None, playlist: str) -> str:
     kind = title_type_for_playlist(playlist)
-    theme = (study_title or "").strip() or "Sem título"
+    theme = clean_study_title(study_title) or "Sem título"
     base = f"IBQB - {kind} - {format_date_br(event_date)} - {theme}"
     return truncate_youtube_title(base)
 
@@ -99,10 +99,31 @@ def truncate_youtube_title(title: str, limit: int = YOUTUBE_TITLE_MAX) -> str:
     return title[: limit - 1].rstrip() + "…"
 
 
+_TITLE_SPLIT = re.compile(r"\s+[—–\-|]\s+")
+_TITLE_META = re.compile(
+    r"(?i)(?:\bebd\b|\bculto\b|\bpalestrante\s*:|\b\d{1,2}/\d{1,2}/\d{2,4}\b)"
+)
+
+
+def clean_study_title(text: str) -> str:
+    """Tema só desta aula: tira sufixos/prefixos que citam EBD, culto, outra data ou palestrante.
+
+    Ex.: 'Perfeitos em Unidade — EBD e Culto do Dia dos Pais' -> 'Perfeitos em Unidade'.
+    """
+    raw = " ".join((text or "").split())
+    if not raw:
+        return ""
+    parts = [part.strip(" —–-|") for part in _TITLE_SPLIT.split(raw) if part.strip(" —–-|")]
+    if not parts:
+        return raw
+    kept = [part for part in parts if not _TITLE_META.search(part)]
+    return " ".join(kept) if kept else parts[0]
+
+
 def study_title_from_summary(summary: dict | None) -> str:
     if not summary:
         return ""
-    return str(summary.get("titulo") or "").strip()
+    return clean_study_title(str(summary.get("titulo") or ""))
 
 
 def extract_study_title_from_transcript(text: str) -> str:
@@ -131,7 +152,7 @@ def render_description(
 ) -> str:
     kind = title_type_for_playlist(playlist)
     header = [
-        "Igreja Batista Quadrangular de Brasília (IBQB)",
+        "IBQB",
         f"Tipo: {kind}",
         f"Data: {format_date_br(event_date)}",
     ]

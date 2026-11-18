@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { api, type Lecture, type Pipeline, type Settings, type Speaker } from "./api";
 import { Dashboard } from "./pages/Dashboard";
 import { Lectures } from "./pages/Lectures";
+import { Lyrics } from "./pages/Lyrics";
 import { Review } from "./pages/Review";
 import { SettingsPage } from "./pages/Settings";
 import { Speakers } from "./pages/Speakers";
@@ -12,6 +13,7 @@ const NAV = [
   { id: "lectures", label: "Aulas" },
   { id: "speakers", label: "Palestrantes" },
   { id: "review", label: "Revisar" },
+  { id: "lyrics", label: "Pendências de letras" },
   { id: "settings", label: "Ajustes" },
 ] as const;
 
@@ -24,6 +26,7 @@ export default function App() {
   const [speakers, setSpeakers] = useState<Speaker[]>([]);
   const [lectures, setLectures] = useState<Lecture[]>([]);
   const [review, setReview] = useState<Lecture[]>([]);
+  const [lyricCount, setLyricCount] = useState(0);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [focus, setFocus] = useState<{ page: Page; id: number; token: number } | null>(null);
@@ -42,12 +45,13 @@ export default function App() {
 
   async function refresh() {
     lastFull.current = Date.now();
-    const [s, p, sp, lec, rev] = await Promise.allSettled([
+    const [s, p, sp, lec, rev, lyrics] = await Promise.allSettled([
       api.settings(),
       api.pipeline(),
       api.speakers(),
       api.lectures(),
       api.review(),
+      api.lyricPendings(),
     ]);
     if (s.status === "fulfilled") setSettings(s.value);
     if (p.status === "fulfilled") {
@@ -63,6 +67,7 @@ export default function App() {
     }
     if (lec.status === "fulfilled") setLectures(lec.value);
     if (rev.status === "fulfilled") setReview(rev.value);
+    if (lyrics.status === "fulfilled") setLyricCount(lyrics.value.length);
     const failed = [s, p, sp, lec, rev].find((item) => item.status === "rejected");
     setError(failed && failed.status === "rejected" ? String(failed.reason instanceof Error ? failed.reason.message : failed.reason) : "");
   }
@@ -151,6 +156,7 @@ export default function App() {
             >
               {item.label}
               {item.id === "review" && review.length > 0 ? ` (${review.length})` : ""}
+              {item.id === "lyrics" && lyricCount > 0 ? ` (${lyricCount})` : ""}
             </button>
           ))}
         </nav>
@@ -242,6 +248,7 @@ export default function App() {
               focusToken={focus?.page === "review" ? focus.token : 0}
             />
           )}
+          {page === "lyrics" && <Lyrics onChange={refresh} />}
           {page === "settings" && (
             <SettingsPage
               settings={settings}

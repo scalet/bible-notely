@@ -8,6 +8,7 @@ const tone: Record<string, string> = {
   pending: "",
   failed: "err",
   needs_review: "warn",
+  awaiting_lyrics: "warn",
   skipped: "err",
   excluded: "",
   downloading: "accent",
@@ -15,6 +16,7 @@ const tone: Record<string, string> = {
   summarizing: "accent",
   uploading: "accent",
   identifying: "accent",
+  compressing: "accent",
 };
 
 const STATUS_LABEL: Record<string, string> = {
@@ -22,6 +24,7 @@ const STATUS_LABEL: Record<string, string> = {
   pending: "na fila",
   failed: "falhou",
   needs_review: "revisar",
+  awaiting_lyrics: "aguardando letra",
   skipped: "ignorada",
   excluded: "excluída",
   downloading: "baixando",
@@ -29,9 +32,10 @@ const STATUS_LABEL: Record<string, string> = {
   summarizing: "resumindo",
   uploading: "enviando",
   identifying: "identificando",
+  compressing: "comprimindo",
 };
 
-const BUSY = new Set(["downloading", "identifying", "transcribing", "summarizing", "uploading"]);
+const BUSY = new Set(["downloading", "identifying", "transcribing", "compressing", "summarizing", "uploading"]);
 const TOO_SMALL = "vídeo abaixo do tamanho mínimo (MIN_VIDEO_BYTES)";
 
 const FILTERS: { id: string; label: string; match: (lecture: Lecture) => boolean }[] = [
@@ -39,7 +43,11 @@ const FILTERS: { id: string; label: string; match: (lecture: Lecture) => boolean
   {
     id: "attention",
     label: "Atenção",
-    match: (lecture) => lecture.status === "failed" || lecture.status === "needs_review" || Boolean(lecture.warning),
+    match: (lecture) =>
+      lecture.status === "failed" ||
+      lecture.status === "needs_review" ||
+      lecture.status === "awaiting_lyrics" ||
+      Boolean(lecture.warning),
   },
   { id: "pending", label: "Fila", match: (lecture) => lecture.status === "pending" },
   { id: "active", label: "Em curso", match: (lecture) => BUSY.has(lecture.status) },
@@ -283,7 +291,7 @@ function LecturePanel({
   const locked = BUSY.has(lecture.status);
   const canAssign = !locked;
   const canReprocess = lecture.status === "failed" || lecture.status === "needs_review";
-  const canExclude = ["pending", "failed", "needs_review", "skipped"].includes(lecture.status);
+  const canExclude = ["pending", "failed", "needs_review", "skipped", "awaiting_lyrics"].includes(lecture.status);
   const canRestore = lecture.status === "excluded" && lecture.error !== TOO_SMALL;
   const pendingSpeaker = confirm === "speaker" ? (speakers.find((speaker) => speaker.id === Number(newSpeaker)) ?? null) : null;
 
@@ -331,10 +339,21 @@ function LecturePanel({
           <dd className="m-0 text-fg">{lecture.identification_status || "—"}</dd>
           <dt className="text-faint">Atualizada</dt>
           <dd className="m-0 text-fg">{formatWhen(lecture.updated_at)}</dd>
+          {lecture.compressed ? (
+            <>
+              <dt className="text-faint">Compressão</dt>
+              <dd className="m-0 text-fg">
+                {formatBytes(lecture.compressed_size)}
+                {lecture.original_size ? ` · original ${formatBytes(lecture.original_size)}` : ""}
+                {lecture.compressed_profile ? <span className="block text-muted">{lecture.compressed_profile}</span> : null}
+              </dd>
+            </>
+          ) : null}
         </dl>
 
         <div className="mt-3 flex flex-wrap gap-1.5">
           <Check on={lecture.transcribed} label="transcrita" />
+          <Check on={Boolean(lecture.compressed)} label="comprimido" />
           <Check on={lecture.summarized} label="resumo" />
           <Check on={lecture.uploaded} label="no Drive" />
           <Check on={Boolean(lecture.youtube_url)} label="no YouTube" />
