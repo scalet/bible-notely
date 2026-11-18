@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import argparse
@@ -90,6 +91,11 @@ def main() -> None:
     parser.add_argument("--video", default="", help="MP4 reduzido para publish --dry-run")
     parser.add_argument("--summary", default="", help="JSON do resumo para publish --dry-run")
     parser.add_argument("--speaker", default="", help="Nome do palestrante para publish --dry-run")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Publica mesmo se já houver outro vídeo do mesmo tipo naquele dia (publish)",
+    )
     args = parser.parse_args()
     setup_logging()
     ensure_schema()
@@ -255,7 +261,7 @@ def main() -> None:
                     print(render_plan(plan))
                     return
                 sent, lessons, skipped, failed = publish_pending(
-                    db, max_items=max(1, args.max), dry_run=args.dry_run, lecture_id=args.id or None
+                    db, max_items=max(1, args.max), dry_run=args.dry_run, lecture_id=args.id or None, force=args.force
                 )
             except PublishError as exc:
                 print(f"erro: {exc}")

@@ -75,6 +75,7 @@ class PublishTest(unittest.TestCase):
             "mana_session_token": settings.mana_session_token,
             "mana_speaker_map": settings.mana_speaker_map,
             "mana_publish_enabled": settings.mana_publish_enabled,
+            "mana_pipeline_lessons": settings.mana_pipeline_lessons,
         }
         settings.data_dir = self.root / "data"
         settings.work_dir = self.root / "work"
@@ -89,6 +90,7 @@ class PublishTest(unittest.TestCase):
         settings.mana_session_token = "session-abc"
         settings.mana_speaker_map = ""
         settings.mana_publish_enabled = True
+        settings.mana_pipeline_lessons = False
         settings.publish_dir.mkdir(parents=True, exist_ok=True)
         settings.publish_work_dir.mkdir(parents=True, exist_ok=True)
         settings.publish_speakers_path.write_text(
@@ -111,6 +113,12 @@ class PublishTest(unittest.TestCase):
         self.speakers = [{"speaker_id": "speaker_gerson", "name": "Gerson", "position": "Professor"}]
         self.expected_title = "IBQB - EBD - 04/01/26 - A fé que opera"
         self.guids = ["guid-1", "guid-2"]
+        self.last_lesson: dict | None = None
+        self.remote_overrides: dict = {}
+        self.fail_meta = False
+        self.fail_patch = False
+        self.transient_videos = 0
+        self.expected_drive_id = "drive-1"
 
     def tearDown(self) -> None:
         for key, value in self.saved.items():
@@ -153,11 +161,22 @@ class PublishTest(unittest.TestCase):
             self.assertEqual(request.headers["AccessKey"], "secret-key")
             body = json.loads(request.content.decode())
             self.assertEqual(body.get("title"), self.expected_title)
-            self.assertTrue(body.get("description"))
+            self.assertNotIn("description", body)
+            self.assertEqual(set(body), {"title"})
+            if self.transient_videos:
+                self.transient_videos -= 1
+                return httpx.Response(503, text="busy")
             guid = self.guids.pop(0)
             return httpx.Response(200, json={"guid": guid, "title": body["title"]})
         if request.method == "POST" and "/library/" in request.url.path and "/videos/" in request.url.path:
             self.assertEqual(request.headers["AccessKey"], "secret-key")
+            body = json.loads(request.content.decode()) if request.content else {}
+            self.assertNotIn("description", body)
+            if "metaTags" in body:
+                tags = {item["property"]: item["value"] for item in body["metaTags"]}
+                self.assertTrue(tags.get("description"))
+            if self.fail_meta:
+                return httpx.Response(400, text="additionalProperties description")
             return httpx.Response(200, json={"success": True})
         if request.method == "POST" and request.url.path == "/tusupload":
             video_id = request.headers["VideoId"]
@@ -172,6 +191,8 @@ class PublishTest(unittest.TestCase):
                 self.assertNotIn("EnabledResolutions", request.headers)
             return httpx.Response(201, headers={"Location": f"https://video.bunnycdn.com/tusupload/{video_id}"})
         if request.method == "PATCH":
+            if self.fail_patch:
+                return httpx.Response(400, text="chunk failed")
             offset = int(request.headers["Upload-Offset"])
             self.uploaded.extend(request.content)
             new_offset = offset + len(request.content)
@@ -188,9 +209,12 @@ class PublishTest(unittest.TestCase):
             return httpx.Response(200, json=self.speakers)
         if request.method == "GET" and request.url.path.startswith("/api/admin/lessons/"):
             lesson_id = request.url.path.rsplit("/", 1)[-1]
-            return httpx.Response(
-                200,
-                json={
+            if self.last_lesson:
+                data = dict(self.last_lesson)
+                data["lesson_id"] = lesson_id
+                data["status"] = self.lesson_status
+            else:
+                data = {
                     "lesson_id": lesson_id,
                     "title": "A fé que opera",
                     "date": "2026-01-04",
@@ -202,17 +226,28 @@ class PublishTest(unittest.TestCase):
                     "verses": ["João 3:16"],
                     "body": "texto",
                     "status": self.lesson_status,
-                },
-            )
+                }
+            if self.youtube_video_id:
+                data["youtube_video_id"] = self.youtube_video_id
+            data.update(self.remote_overrides)
+            return httpx.Response(200, json=data)
         if request.method == "POST" and request.url.path == "/api/admin/lessons":
             body = self._assert_lesson_body(request)
-            return httpx.Response(201, json=self._lesson_json("aula_1", body, self.create_status))
+            self.last_lesson = self._lesson_json("aula_1", body, self.create_status)
+            return httpx.Response(201, json=self.last_lesson)
         if request.method == "PUT" and request.url.path.startswith("/api/admin/lessons/"):
             lesson_id = request.url.path.rsplit("/", 1)[-1]
             body = self._assert_lesson_body(request)
             if self.youtube_video_id:
                 self.assertEqual(body["youtube_url"], f"https://www.youtube.com/watch?v={self.youtube_video_id}")
-            return httpx.Response(200, json=self._lesson_json(lesson_id, body, "draft"))
+            self.last_lesson = self._lesson_json(lesson_id, body, "draft")
+            return httpx.Response(200, json=self.last_lesson)
+        if request.method == "PUT" and request.url.path.startswith("/api/pipeline/lessons/"):
+            drive_id = request.url.path.rsplit("/", 1)[-1]
+            body = self._assert_lesson_body(request)
+            self.assertEqual(drive_id, self.expected_drive_id)
+            self.last_lesson = self._lesson_json("aula_pipeline", body, "draft")
+            return httpx.Response(200, json=self.last_lesson)
         return httpx.Response(500, text=f"inesperado {request.method} {request.url}")
 
     def _assert_lesson_body(self, request: httpx.Request) -> dict:
@@ -229,6 +264,7 @@ class PublishTest(unittest.TestCase):
         self.assertIn("Romanos 5:3-5", body["verses"])
         self.assertIn("Deus amou o mundo", body["body"])
         self.assertTrue(body["bunny_video_id"])
+        self.assertEqual(request.headers.get("Idempotency-Key"), self.expected_drive_id)
         return body
 
     def _lesson_json(self, lesson_id: str, body: dict, status: str) -> dict:
@@ -596,6 +632,99 @@ class PublishTest(unittest.TestCase):
         self.assertIn("Roberto", text)
 
 
+
+    def test_guid_is_kept_if_description_update_fails(self) -> None:
+        lecture = self._lecture()
+        self._video(lecture)
+        self.fail_meta = True
+        result = self._run(lecture)
+        self.assertEqual(result.bunny_video_id, "guid-1")
+        state = json.loads(settings.publish_state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["uploads"]["drive-1"]["bunny_video_id"], "guid-1")
+        meta = [url for method, url in self.calls if method == "POST" and "/videos/guid-1" in url]
+        self.assertTrue(meta)
+
+    def test_tus_location_is_saved_before_chunks(self) -> None:
+        lecture = self._lecture()
+        self._video(lecture)
+        self.fail_patch = True
+        with self.assertRaises(PublishError):
+            self._run(lecture)
+        state = json.loads(settings.publish_state_path.read_text(encoding="utf-8"))
+        entry = state["uploads"]["drive-1"]
+        self.assertEqual(entry["bunny_video_id"], "guid-1")
+        self.assertEqual(entry["tus_url"], "https://video.bunnycdn.com/tusupload/guid-1")
+        self.assertFalse(entry.get("upload_complete"))
+
+    def test_create_video_retries_transient_errors(self) -> None:
+        lecture = self._lecture()
+        self._video(lecture)
+        self.transient_videos = 1
+        result = self._run(lecture)
+        self.assertEqual(result.bunny_video_id, "guid-1")
+        creates = [url for method, url in self.calls if method == "POST" and url.endswith("/videos")]
+        self.assertGreaterEqual(len(creates), 2)
+
+    def test_http_error_becomes_publish_error(self) -> None:
+        lecture = self._lecture()
+        self._video(lecture)
+
+        def boom(_request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("offline")
+
+        with self.assertRaises(PublishError) as caught:
+            http = httpx.Client(transport=httpx.MockTransport(boom))
+            try:
+                publish_lecture(self.db, lecture, http=http, sleep=lambda _s: None, clock=Clock(), now=lambda: 1_700_000_000)
+            finally:
+                http.close()
+        self.assertIn("rede", str(caught.exception))
+
+    def test_human_edited_draft_is_not_overwritten(self) -> None:
+        lecture = self._lecture()
+        self._video(lecture)
+        first = self._run(lecture)
+        self.assertEqual(first.action, "uploaded")
+        self.calls.clear()
+        self.statuses = [4]
+        data = json.loads(lecture.summary_text)
+        data["titulo"] = "Título novo que não pode sobrescrever a edição humana"
+        lecture.summary_text = json.dumps(data, ensure_ascii=False)
+        self.db.commit()
+        self.expected_title = "IBQB - EBD - 04/01/26 - Título novo que não pode sobrescrever a edição humana"
+        self.remote_overrides = {"title": "Título editado no site", "body": "pessoa mudou o texto"}
+        second = self._run(lecture)
+        self.assertEqual(second.action, "skipped")
+        self.assertIn("editada", second.detail)
+        self.assertIn(("GET", "https://mana.example/api/admin/lessons/aula_1"), self.calls)
+        self.assertFalse(any(method == "PUT" for method, _url in self.calls))
+        self.assertFalse(any(method == "POST" and url.endswith("/api/admin/lessons") for method, url in self.calls))
+
+    def test_force_overrides_same_day_kind_conflict(self) -> None:
+        first = self._lecture(drive_id="drive-1")
+        self._video(first)
+        self._run(first)
+        second = self._lecture(filename="20260104_093000.mp4", drive_id="drive-2")
+        self._video(second)
+        self.expected_drive_id = "drive-2"
+        self.statuses = [4]
+        skipped = self._run(second)
+        self.assertEqual(skipped.action, "skipped")
+        self.assertIn("já há um", skipped.detail)
+        forced = self._run(second, force=True)
+        self.assertEqual(forced.action, "uploaded")
+        self.assertEqual(forced.bunny_video_id, "guid-2")
+
+    def test_pipeline_upsert_uses_drive_file_id_path(self) -> None:
+        settings.mana_pipeline_lessons = True
+        lecture = self._lecture()
+        self._video(lecture)
+        result = self._run(lecture)
+        self.assertEqual(result.lesson_id, "aula_pipeline")
+        self.assertIn(("PUT", "https://mana.example/api/pipeline/lessons/drive-1"), self.calls)
+        self.assertFalse(any(method == "POST" and url.endswith("/api/admin/lessons") for method, url in self.calls))
+
+
 class ReleaseLocalVideoTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = TemporaryDirectory()
@@ -637,6 +766,12 @@ class ReleaseLocalVideoTest(unittest.TestCase):
     def test_failure_stays_pending(self) -> None:
         settings.publish_enabled = True
         with mock.patch("backend.app.services.publish.publish_lecture", side_effect=PublishError("rede")):
+            pending = pipeline._maybe_publish(self.db, self.lecture)
+        self.assertTrue(pending)
+
+    def test_http_error_stays_pending(self) -> None:
+        settings.publish_enabled = True
+        with mock.patch("backend.app.services.publish.publish_lecture", side_effect=httpx.ConnectError("offline")):
             pending = pipeline._maybe_publish(self.db, self.lecture)
         self.assertTrue(pending)
 

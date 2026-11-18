@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+import httpx
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
@@ -202,11 +203,14 @@ def _maybe_publish(db: Session, lecture: Lecture) -> bool:
     except PublishError as exc:
         log.error("publicação de %s não concluiu: %s", lecture.video_filename, exc)
         return True
+    except httpx.HTTPError as exc:
+        log.error("publicação de %s não concluiu: %s", lecture.video_filename, exc)
+        return True
     return False
 
 
-def _finish_local(db: Session, lecture: Lecture, video_path: Path, *, done_message: str) -> None:
-    pending = _maybe_publish(db, lecture)
+async def _finish_local(db: Session, lecture: Lecture, video_path: Path, *, done_message: str) -> None:
+    pending = await asyncio.to_thread(_maybe_publish, db, lecture)
     release_local_original(lecture, video_path)
     if pending:
         set_pipeline(stage="publish", message=f"Publicação pendente: {lecture.video_filename}")
@@ -496,7 +500,7 @@ async def process_one(
             lecture.status = "done"
             _touch(lecture)
             db.commit()
-            _finish_local(db, lecture, video_path, done_message=f"Já enviado: {lecture.video_filename}")
+            await _finish_local(db, lecture, video_path, done_message=f"Já enviado: {lecture.video_filename}")
             return lecture
 
         held_for_review = False
@@ -689,7 +693,7 @@ async def process_one(
         lecture.status = "done"
         _touch(lecture)
         db.commit()
-        _finish_local(db, lecture, video_path, done_message=f"Concluído: {lecture.video_filename}")
+        await _finish_local(db, lecture, video_path, done_message=f"Concluído: {lecture.video_filename}")
         log.info("PDF da aula mantido em %s", pdf_path)
         return lecture
     except (drive.DriveCancelled, TranscribeCancelled, CompressCancelled):

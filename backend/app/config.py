@@ -1,3 +1,4 @@
+
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -77,6 +78,8 @@ class Settings(BaseSettings):
     mana_speaker_map: str = ""
     # Desligado: não chama o Maná. Ligado ainda exige sessão Google; ver docs/mana-publish.md.
     mana_publish_enabled: bool = False
+    # Quando o Maná tiver PUT /api/pipeline/lessons/{drive_file_id}, ligue esta flag.
+    mana_pipeline_lessons: bool = False
 
     @property
     def db_path(self) -> Path:

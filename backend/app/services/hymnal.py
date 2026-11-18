@@ -36,7 +36,13 @@ _NUMBER_QUERY = re.compile(r"(?i)^(?:hino|n[oº°]?\.?|cc|cantor(?:\s+cristao)?)
 
 
 
-_SLIDE_TITLE = re.compile(r"^\d{1,4}\s*[-–—]\s*[“\"«].*[”\"»]\s*$")
+_SLIDE_TITLE = re.compile(
+    r"^(?:"
+    r"\d{1,4}\s*[-–—]\s*[“\"«]?\s*.+?\s*[”\"»]?\s*"  # 6 - título, com ou sem aspas
+    r"|[“\"«]\s*.{1,80}?[”\"»]\s*"  # “TÍTULO” sozinho no slide
+    r")$"
+)
+_PAGE_MARK = re.compile(r"^\d{1,2}\s*/\s*\d{1,2}$")
 _STROPH_MARK = re.compile(r"^(?:\d{1,2}\s*\.{1,2}|[•●])\s*")
 
 
@@ -45,7 +51,7 @@ def is_slide_chrome(line: str, number: str = "", title: str = "") -> bool:
     stripped = (line or "").strip()
     if not stripped:
         return False
-    if _HEADER.match(stripped) or _SLIDE_TITLE.match(stripped):
+    if _HEADER.match(stripped) or _SLIDE_TITLE.match(stripped) or _PAGE_MARK.match(stripped):
         return True
     if number and fold(stripped) in {
         fold(f"{number} {title}"),
@@ -243,7 +249,10 @@ def _slides_to_stanza_text(text: str) -> str:
     """Cada repetição do título do slide abre um bloco: vira linha em branco entre estrofes."""
     out: list[str] = []
     for line in text.splitlines():
-        if _SLIDE_TITLE.match(line.strip()):
+        stripped = line.strip()
+        if _PAGE_MARK.match(stripped):
+            continue
+        if _SLIDE_TITLE.match(stripped) or is_slide_chrome(stripped):
             if out and out[-1] != "":
                 out.append("")
             continue
@@ -253,14 +262,69 @@ def _slides_to_stanza_text(text: str) -> str:
     return "\n".join(out).strip() + "\n"
 
 
+def _odp_text(element) -> str:
+    """Texto de um nó ODF, respeitando text:line-break e text:s."""
+    from xml.etree import ElementTree as ET
+
+    parts: list[str] = []
+    if element.text:
+        parts.append(element.text)
+    for child in list(element):
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag in {"line-break", "br"}:
+            parts.append("\n")
+        elif tag == "s":
+            count = 1
+            for attr, value in child.attrib.items():
+                if attr == "c" or attr.endswith("}c"):
+                    try:
+                        count = max(1, int(value))
+                    except ValueError:
+                        count = 1
+            parts.append(" " * count)
+        elif tag == "tab":
+            parts.append("\t")
+        else:
+            parts.append(_odp_text(child))
+        if child.tail:
+            parts.append(child.tail)
+    return "".join(parts)
+
+
+def odp_to_stanza_text(path: Path) -> str:
+    """Lê text:p de cada draw:page em content.xml e monta as estrofes."""
+    from xml.etree import ElementTree as ET
+
+    with zipfile.ZipFile(path) as archive:
+        try:
+            xml = archive.read("content.xml")
+        except KeyError as exc:
+            raise HymnalError(f"{path.name} não tem content.xml") from exc
+    root = ET.fromstring(xml)
+    text_ns = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}"
+    draw_ns = "{urn:oasis:names:tc:opendocument:xmlns:drawing:1.0}"
+    pages = list(root.iter(f"{draw_ns}page")) or [root]
+    chunks: list[str] = []
+    for page in pages:
+        lines: list[str] = []
+        for para in page.iter(f"{text_ns}p"):
+            for line in _odp_text(para).splitlines():
+                stripped = line.strip()
+                if stripped:
+                    lines.append(stripped)
+        if lines:
+            chunks.append("\n".join(lines))
+    return _slides_to_stanza_text("\n".join(chunks))
+
+
 def convert_slides(files: list[Path], dest: Path, batch: int = 25) -> list[Path]:
     """Converte .pps/.ppt/.pptx com LibreOffice headless e grava um .txt por hino."""
     soffice = shutil.which("soffice") or shutil.which("libreoffice")
     if not soffice:
         raise HymnalError("o hinário veio em slides; instale o LibreOffice (soffice) para converter")
     dest.mkdir(parents=True, exist_ok=True)
-    html_dir = dest / "_html"
-    html_dir.mkdir(exist_ok=True)
+    odp_dir = dest / "_odp"
+    odp_dir.mkdir(exist_ok=True)
     written: list[Path] = []
     with tempfile.TemporaryDirectory(prefix="lo-hymnal-") as profile:
         for index in range(0, len(files), batch):
@@ -268,21 +332,21 @@ def convert_slides(files: list[Path], dest: Path, batch: int = 25) -> list[Path]
             cmd = [
                 soffice, "--headless", "--nologo", "--norestore", "--nofirststartwizard",
                 f"-env:UserInstallation=file://{profile}",
-                "--convert-to", "html", "--outdir", str(html_dir), *[str(path) for path in chunk],
+                "--convert-to", "odp", "--outdir", str(odp_dir), *[str(path) for path in chunk],
             ]
             result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
             if result.returncode != 0:
                 log.warning("soffice falhou num lote: %s", (result.stdout or "")[-500:])
             for path in chunk:
-                html = html_dir / f"{path.stem}.html"
-                if not html.is_file():
+                odp = odp_dir / f"{path.stem}.odp"
+                if not odp.is_file():
                     log.warning("slide sem conversão: %s", path.name)
                     continue
-                text = _slides_to_stanza_text(_visible_text(read_text(html)))
+                text = odp_to_stanza_text(odp)
                 target = dest / f"{path.stem}.txt"
                 target.write_text(text, encoding="utf-8")
                 written.append(target)
-    shutil.rmtree(html_dir, ignore_errors=True)
+    shutil.rmtree(odp_dir, ignore_errors=True)
     return written
 
 

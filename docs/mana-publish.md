@@ -36,6 +36,10 @@ Rotas de admin, prefixo `/api`:
 
 O cliente deste repositório manda só `draft`. Antes de um `PUT`, ele faz `GET`. Se `status` é `published`, não envia `PUT`, não envia `POST` e não chama `PUT .../bunny-video`. A resposta de criação que já volta `published` também não é seguida de outra escrita.
 
+Uma aula rascunho que uma pessoa já editou (título, corpo, versículos, tipo, data, palestrante ou status diferentes do último envio) também não é sobrescrita. `cli publish --force` só ignora o limite de um vídeo do mesmo tipo no mesmo dia.
+
+O cliente envia `Idempotency-Key: {drive_file_id}` no `POST`/`PUT` de aula e persiste o rascunho em `state.json` antes do `POST`, para não criar outra aula se a execução cair no meio. A interface `ManaLessons.upsert_lesson(drive_file_id, …)` já está pronta para o futuro `PUT /api/pipeline/lessons/{drive_file_id}` (ligue `MANA_PIPELINE_LESSONS`). Até essa rota existir, o cliente continua em `/api/admin/lessons`.
+
 O `speaker_id` vem de `data/publish/speakers.json` ou de `MANA_SPEAKER_MAP` (JSON `{"Gerson": "speaker_abc"}`). O arquivo entra primeiro; a variável cobre o mesmo nome. Sem mapa, o cliente chama `GET /api/admin/speakers` e casa o nome sem acento e sem diferença de maiúsculas. Dois cadastros com o mesmo nome interrompem a aula, em vez de escolher um.
 
 Exemplo do `POST /api/admin/lessons`:

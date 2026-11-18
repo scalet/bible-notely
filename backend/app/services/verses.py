@@ -162,6 +162,16 @@ def _expand(spec: str) -> list[int]:
     return numbers
 
 
+def _verse_search_window(verse: str) -> float:
+    """Janela para achar o trecho lido; versículos longos precisam de mais do que 40s."""
+    return max(40.0, min(180.0, 20 + len(verse) / 8))
+
+
+def _verse_duration(verse: str) -> float:
+    """Duração de recuo quando o alinhamento não acha o segmento."""
+    return max(8.0, min(90.0, 4 + len(verse) / 12))
+
+
 def _clamp(start: float, end: float, floor: float = 6.0, ceiling: float = 22.0) -> tuple[float, float]:
     if end < start + floor:
         end = start + floor
@@ -182,9 +192,9 @@ def _align(segments: list[Segment], origin: float, until: float, verse: str) -> 
             best_score = score
             best = segment
     if best is not None and best_score >= 0.34:
-        return _clamp(best.start, best.end)
-    length = max(8.0, min(18.0, 4 + len(verse) / 14))
-    return origin, origin + length
+        ceiling = max(22.0, min(90.0, 6 + len(verse) / 12))
+        return _clamp(best.start, best.end, ceiling=ceiling)
+    return origin, origin + _verse_duration(verse)
 
 
 def _phrase_in_order(haystack: list[str], needle: list[str]) -> bool:
@@ -254,7 +264,7 @@ def detect_verse_cues(transcript: str, *, load_passage, fetch_chapter) -> list[V
                 if key in seen:
                     continue
                 seen.add(key)
-                start, end = _align(segments, segment.start, segment.start + 40, text)
+                start, end = _align(segments, segment.start, segment.start + _verse_search_window(text), text)
                 cues.append(VerseCue(start=start, end=end, title=f"{book} {chapter}:{number}", body=text))
     cues.sort(key=lambda cue: (cue.start, cue.title))
     packed: list[VerseCue] = []

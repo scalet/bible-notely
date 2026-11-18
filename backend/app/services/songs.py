@@ -22,6 +22,7 @@ COMMON_SHARE = 0.03  # palavra em mais de 3% dos hinos (deus, senhor, jesus...) 
 MUSIC_GAP = 8.0  # segundos sem fala na transcrição: o Whisper costuma calar durante o canto
 _ANNOUNCE = re.compile(r"hino\s+(?:de\s+)?(?:numero\s+|n\s*)?(\d{1,3})\b")
 _COMMON: set[str] = set()
+_SHARED_LINES: set[str] = set()
 
 
 @dataclass
@@ -58,6 +59,16 @@ def _index(songs: list[SongText]) -> tuple[dict[str, set[int]], list[list[set[st
     return postings, per_song
 
 
+def _line_key(tokens: list[str] | str) -> str:
+    if isinstance(tokens, str):
+        tokens = content_tokens(tokens)
+    return " ".join(tokens)
+
+
+def _is_shared_line(tokens: list[str]) -> bool:
+    return _line_key(tokens) in _SHARED_LINES
+
+
 def _lyric_lines(stanzas: tuple[str, ...] | list[str], rare_only: bool = True) -> list[list[str]]:
     """Linhas distintas com 2+ palavras raras (refrão repetido conta uma vez)."""
     seen: set[str] = set()
@@ -76,9 +87,11 @@ def _lyric_lines(stanzas: tuple[str, ...] | list[str], rare_only: bool = True) -
 
 
 def _line_hits(window_tokens: set[str], stanzas: tuple[str, ...] | list[str], rare_only: bool = True) -> int:
-    """Quantas linhas distintas da letra têm evidência clara no trecho."""
+    """Quantas linhas distintas e não compartilhadas da letra batem no trecho."""
     hits = 0
     for tokens in _lyric_lines(stanzas, rare_only):
+        if _is_shared_line(tokens):
+            continue
         unique = set(tokens)
         needed = len(unique) if len(unique) < 3 else max(3, int(MIN_LINE_TOKEN_RATIO * len(unique) + 0.999))
         if len(window_tokens & unique) >= needed:
@@ -91,6 +104,8 @@ def _lines_in_order(window_text: str, stanzas: tuple[str, ...] | list[str], rare
     haystack = content_tokens(window_text)
     matched = 0
     for needle in _lyric_lines(stanzas, rare_only):
+        if _is_shared_line(needle):
+            continue
         if _find_seq(haystack, needle) is not None:
             matched += 1
             if matched >= MIN_LINE_HITS:
@@ -269,13 +284,24 @@ def _announced_numbers(segments, start: float, end: float) -> set[str]:
 
 
 def _set_common(catalog: list[SongText]) -> None:
-    global _COMMON
+    global _COMMON, _SHARED_LINES
     df: dict[str, int] = {}
+    line_df: dict[str, int] = {}
     for song in catalog:
         for token in {token for stanza in song.stanzas for token in content_tokens(stanza)}:
             df[token] = df.get(token, 0) + 1
+        seen: set[str] = set()
+        for stanza in song.stanzas:
+            for line in str(stanza).splitlines():
+                key = _line_key(line)
+                if len(key.split()) < 3 or key in seen:
+                    continue
+                seen.add(key)
+                line_df[key] = line_df.get(key, 0) + 1
     limit = max(3, int(len(catalog) * COMMON_SHARE))
     _COMMON = {token for token, count in df.items() if count > limit} if len(catalog) >= 50 else set()
+    # Refrão que aparece em 3+ hinos não prova o cântico sozinho.
+    _SHARED_LINES = {key for key, count in line_df.items() if count >= 3} if len(catalog) >= 8 else set()
 
 
 def _covered(start: float, end: float, intervals: list[tuple[float, float]]) -> bool:

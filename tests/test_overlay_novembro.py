@@ -255,13 +255,41 @@ class RetouchTest(unittest.TestCase):
         self.assertEqual(len(split_verse_pages("Eu sou a ressurreição e a vida.", max_lines=3)), 1)
 
 
+def _sample_odp(path: Path, pages: list[list[str]]) -> None:
+    """ODP mínimo com text:p e text:line-break, como o LibreOffice gera do .pps."""
+    import zipfile
+    from xml.sax.saxutils import escape
+
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"',
+        ' xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"',
+        ' xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"',
+        ' xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0">',
+        "<office:body><office:presentation>",
+    ]
+    for page in pages:
+        parts.append("<draw:page><draw:frame><draw:text-box>")
+        for block in page:
+            lines = block.split("\n")
+            parts.append("<text:p>")
+            for index, line in enumerate(lines):
+                if index:
+                    parts.append("<text:span><text:line-break/></text:span>")
+                parts.append(f"<text:span>{escape(line)}</text:span>")
+            parts.append("</text:p>")
+        parts.append("</draw:text-box></draw:frame></draw:page>")
+    parts.append("</office:presentation></office:body></office:document-content>")
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("mimetype", "application/vnd.oasis.opendocument.presentation")
+        archive.writestr("content.xml", "\n".join(parts))
+
+
 class SlideHymnalTest(unittest.TestCase):
-    HTML = (
-        "<html><head><style>p{}</style></head><body><h1>Slide 1</h1>"
-        "<p>6 - “GLÓRIA AO SENHOR”</p><p>1..A NOSSO PAI DO CÉU,</p><p>TRIBUTA LÁBIO MEU</p>"
-        "<h1>Slide 2</h1><p>6 - “GLÓRIA AO SENHOR”</p><p>2..LOUVEMOS AO SENHOR,</p><p>O SANTO REDENTOR,</p>"
-        "</body></html>"
-    )
+    PAGES = [
+        ["6 - “GLÓRIA AO SENHOR”", "1..A NOSSO PAI DO CÉU,\nTRIBUTA LÁBIO MEU"],
+        ["6 - “GLÓRIA AO SENHOR”", "2..LOUVEMOS AO SENHOR,\nO SANTO REDENTOR,"],
+    ]
 
     def test_zip_of_pps_is_converted_and_indexed(self) -> None:
         from unittest import mock
@@ -269,9 +297,10 @@ class SlideHymnalTest(unittest.TestCase):
         from backend.app.services import hymnal
 
         def fake_run(cmd, **kwargs):
+            self.assertIn("odp", cmd)
             outdir = Path(cmd[cmd.index("--outdir") + 1])
             for name in cmd[cmd.index("--outdir") + 2 :]:
-                (outdir / f"{Path(name).stem}.html").write_text(self.HTML, encoding="utf-8")
+                _sample_odp(outdir / f"{Path(name).stem}.odp", self.PAGES)
             return mock.Mock(returncode=0, stdout="")
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -290,6 +319,17 @@ class SlideHymnalTest(unittest.TestCase):
             cleaned = clean_stanzas(song.stanzas, song.number, song.title)
             self.assertEqual(cleaned[0], "A nosso Pai do céu,\ntributa lábio meu")
             self.assertEqual(cleaned[1], "Louvemos ao Senhor,\no santo Redentor,")
+
+    def test_quoted_and_unquoted_titles_are_chrome(self) -> None:
+        from backend.app.services.hymnal import is_slide_chrome
+
+        self.assertTrue(is_slide_chrome("6 - “GLÓRIA AO SENHOR”"))
+        self.assertTrue(is_slide_chrome("6 - GLÓRIA AO SENHOR"))
+        self.assertTrue(is_slide_chrome("“GLÓRIA AO SENHOR”"))
+        self.assertTrue(is_slide_chrome('"Glória ao Senhor"'))
+        self.assertTrue(is_slide_chrome("1/4"))
+        self.assertFalse(is_slide_chrome("A NOSSO PAI DO CÉU,"))
+        self.assertFalse(is_slide_chrome("tributa lábio meu glória e louvor"))
 
     def test_missing_libreoffice_is_a_clear_error(self) -> None:
         from unittest import mock

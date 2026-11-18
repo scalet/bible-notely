@@ -59,6 +59,41 @@ class PublishError(RuntimeError):
     pass
 
 
+RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+DEFAULT_RETRIES = 3
+
+
+def request_with_retry(
+    http: httpx.Client,
+    method: str,
+    url: str,
+    *,
+    retries: int = DEFAULT_RETRIES,
+    sleep: Callable[[float], None] = time.sleep,
+    **kwargs,
+) -> httpx.Response:
+    """Repete falhas transitórias e transforma httpx.HTTPError em PublishError."""
+    delay = 1.0
+    attempts = max(1, retries)
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            response = http.request(method, url, **kwargs)
+        except httpx.HTTPError as exc:
+            last_error = exc
+            if attempt >= attempts - 1:
+                raise PublishError(f"falha de rede ao chamar {url}: {exc}") from exc
+            sleep(delay)
+            delay *= 2
+            continue
+        if response.status_code in RETRY_STATUSES and attempt < attempts - 1:
+            sleep(delay)
+            delay *= 2
+            continue
+        return response
+    raise PublishError(f"falha de rede ao chamar {url}: {last_error}")
+
+
 @dataclass
 class PublishResult:
     action: str
@@ -399,6 +434,7 @@ def plan_publish(
     source: Path | None = None,
     db: Session | None = None,
     state: dict | None = None,
+    force: bool = False,
 ) -> PublishPlan:
     when = event_date_for(lecture)
     if when is None:
@@ -417,7 +453,7 @@ def plan_publish(
         size = path.stat().st_size
         file_s = str(path)
         conflict = same_day_kind_conflict(db, lecture, state)
-        if conflict:
+        if conflict and not force:
             skip = f"já há um {event_kind_label(kind)} neste dia ({conflict})"
     return PublishPlan(
         file=file_s,
@@ -488,6 +524,45 @@ def plan_from_paths(video: Path, summary_path: Path | None, speaker_name: str = 
 def lesson_fingerprint(payload: dict) -> str:
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+_LESSON_GUARD_FIELDS = ("title", "date", "type", "speaker_id", "verses", "body", "status")
+
+
+def _norm_guard_value(key: str, value):
+    if key == "verses":
+        items = []
+        for item in value or []:
+            if isinstance(item, str):
+                items.append(item)
+            elif isinstance(item, dict):
+                items.append(json.dumps(item, ensure_ascii=False, sort_keys=True))
+            else:
+                items.append(str(item))
+        return items
+    if value is None:
+        return ""
+    if key == "status":
+        return str(value).strip().lower()
+    return value
+
+
+def lesson_view(payload: dict | None) -> dict:
+    """Campos que uma pessoa pode ter editado no site; usados para não sobrescrever."""
+    if not payload:
+        return {}
+    return {key: _norm_guard_value(key, payload.get(key)) for key in _LESSON_GUARD_FIELDS}
+
+
+def lesson_was_edited(current: dict | None, last_written: dict | None) -> bool:
+    if not current or not last_written:
+        return False
+    return lesson_view(current) != lesson_view(last_written)
+
+
+def lesson_is_published(data: dict | None) -> bool:
+    status = str((data or {}).get("status") or "").strip().lower()
+    return status in {"published", "publicada", "publicado"}
 
 
 def empty_state() -> dict:
@@ -565,22 +640,47 @@ def require_mana() -> None:
 
 
 class ManaLessons:
-    """POST/PUT /api/admin/lessons. Authorization é o session_token do Google, não uma API key."""
+    """Cliente da aula no Maná.
 
-    def __init__(self, http: httpx.Client, base_url: str, session_token: str) -> None:
+    Hoje fala com POST/PUT /api/admin/lessons (sessão Google). A mesma interface
+    `upsert_lesson(drive_file_id, …)` já está pronta para o futuro
+    PUT /api/pipeline/lessons/{drive_file_id} (MANA_PIPELINE_LESSONS).
+    A chave de idempotência é o drive_file_id.
+    """
+
+    ADMIN_LESSONS = "/api/admin/lessons"
+    PIPELINE_LESSONS = "/api/pipeline/lessons"
+
+    def __init__(
+        self,
+        http: httpx.Client,
+        base_url: str,
+        session_token: str,
+        *,
+        use_pipeline: bool | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         root = base_url.strip().rstrip("/")
         if root.endswith("/api"):
             root = root[: -len("/api")]
         self.origin = root
         self.http = http
         self.token = session_token.strip()
+        self.use_pipeline = settings.mana_pipeline_lessons if use_pipeline is None else use_pipeline
+        self.sleep = sleep
 
-    def _headers(self) -> dict[str, str]:
-        return {
+    def _headers(self, drive_file_id: str = "") -> dict[str, str]:
+        headers = {
             "Authorization": f"Bearer {self.token}",
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
+        if drive_file_id:
+            headers["Idempotency-Key"] = drive_file_id
+        return headers
+
+    def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        return request_with_retry(self.http, method, url, sleep=self.sleep, **kwargs)
 
     def _data(self, response: httpx.Response, action: str) -> object:
         if response.status_code >= 400:
@@ -592,7 +692,7 @@ class ManaLessons:
             raise PublishError("Maná não devolveu JSON") from exc
 
     def get_lesson(self, lesson_id: str) -> dict | None:
-        response = self.http.get(f"{self.origin}/api/admin/lessons/{lesson_id}", headers=self._headers())
+        response = self._request("GET", f"{self.origin}{self.ADMIN_LESSONS}/{lesson_id}", headers=self._headers())
         if response.status_code == 404:
             return None
         data = self._data(response, "ler a aula")
@@ -601,29 +701,57 @@ class ManaLessons:
         return data
 
     def list_speakers(self) -> list[dict]:
-        response = self.http.get(f"{self.origin}/api/admin/speakers", headers=self._headers())
+        response = self._request("GET", f"{self.origin}/api/admin/speakers", headers=self._headers())
         data = self._data(response, "listar palestrantes")
         if not isinstance(data, list):
             raise PublishError("Maná devolveu palestrantes inválidos")
         return [row for row in data if isinstance(row, dict)]
 
-    def create_lesson(self, payload: dict) -> dict:
+    def create_lesson(self, payload: dict, drive_file_id: str = "") -> dict:
         reject_unless_draft(payload)
         if not str(payload.get("speaker_id") or "").strip():
             raise PublishError("speaker_id obrigatório")
-        response = self.http.post(f"{self.origin}/api/admin/lessons", headers=self._headers(), json=payload)
+        response = self._request(
+            "POST",
+            f"{self.origin}{self.ADMIN_LESSONS}",
+            headers=self._headers(drive_file_id),
+            json=payload,
+        )
         return self._lesson(self._data(response, "criar a aula"))
 
-    def update_lesson(self, lesson_id: str, payload: dict) -> dict:
+    def update_lesson(self, lesson_id: str, payload: dict, drive_file_id: str = "") -> dict:
         reject_unless_draft(payload)
         if not str(payload.get("speaker_id") or "").strip():
             raise PublishError("speaker_id obrigatório")
-        response = self.http.put(
-            f"{self.origin}/api/admin/lessons/{lesson_id}",
-            headers=self._headers(),
+        response = self._request(
+            "PUT",
+            f"{self.origin}{self.ADMIN_LESSONS}/{lesson_id}",
+            headers=self._headers(drive_file_id),
             json=payload,
         )
         return self._lesson(self._data(response, "atualizar a aula"))
+
+    def upsert_lesson(self, drive_file_id: str, payload: dict, *, lesson_id: str = "") -> dict:
+        """Grava a aula de forma idempotente pela chave drive_file_id."""
+        if not str(drive_file_id or "").strip():
+            raise PublishError("drive_file_id obrigatório para gravar a aula")
+        if self.use_pipeline:
+            return self._put_pipeline(drive_file_id, payload)
+        if lesson_id:
+            return self.update_lesson(lesson_id, payload, drive_file_id=drive_file_id)
+        return self.create_lesson(payload, drive_file_id=drive_file_id)
+
+    def _put_pipeline(self, drive_file_id: str, payload: dict) -> dict:
+        reject_unless_draft(payload)
+        if not str(payload.get("speaker_id") or "").strip():
+            raise PublishError("speaker_id obrigatório")
+        response = self._request(
+            "PUT",
+            f"{self.origin}{self.PIPELINE_LESSONS}/{drive_file_id}",
+            headers=self._headers(drive_file_id),
+            json=payload,
+        )
+        return self._lesson(self._data(response, "gravar a aula"))
 
     def _lesson(self, data: object) -> dict:
         if not isinstance(data, dict) or not str(data.get("lesson_id") or "").strip():
@@ -678,6 +806,7 @@ class BunnyStream:
         chunk_size: int,
         limit_720: bool,
         now: Callable[[], int] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.http = http
         self.library_id = library_id.strip()
@@ -687,6 +816,10 @@ class BunnyStream:
         self.chunk_size = max(1, chunk_size)
         self.limit_720 = limit_720
         self._now = now or (lambda: int(time.time()))
+        self.sleep = sleep
+
+    def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        return request_with_retry(self.http, method, url, sleep=self.sleep, **kwargs)
 
     def _auth(self, video_id: str) -> dict[str, str]:
         expiration = self._now() + 86400
@@ -708,14 +841,13 @@ class BunnyStream:
         detail = _redact(response.text, [self.api_key])
         raise PublishError(f"Bunny falhou ao {action} ({response.status_code}): {detail}")
 
-    def create_video(self, title: str, description: str = "") -> str:
-        body = {"title": title}
-        if description:
-            body["description"] = description
-        response = self.http.post(
+    def create_video(self, title: str) -> str:
+        """CreateVideoModel aceita só title (e opcionalmente collectionId/thumbnailTime)."""
+        response = self._request(
+            "POST",
             f"{self.api_base}/library/{self.library_id}/videos",
             headers={"AccessKey": self.api_key, "Accept": "application/json"},
-            json=body,
+            json={"title": title},
         )
         self._fail(response, "criar o vídeo")
         try:
@@ -724,20 +856,28 @@ class BunnyStream:
             raise PublishError("Bunny não devolveu JSON ao criar o vídeo") from exc
         if not guid:
             raise PublishError("Bunny não devolveu guid")
-        if description:
-            self.update_video_meta(guid, title=title, description=description)
         return guid
 
-    def update_video_meta(self, video_id: str, *, title: str, description: str) -> None:
-        response = self.http.post(
+    def update_video_meta(self, video_id: str, *, title: str = "", description: str = "") -> None:
+        """UpdateVideoModel não tem description; a descrição vai em metaTags.property=description."""
+        body: dict = {}
+        if title:
+            body["title"] = title
+        if description:
+            body["metaTags"] = [{"property": "description", "value": description}]
+        if not body:
+            return
+        response = self._request(
+            "POST",
             f"{self.api_base}/library/{self.library_id}/videos/{video_id}",
             headers={"AccessKey": self.api_key, "Accept": "application/json"},
-            json={"title": title, "description": description},
+            json=body,
         )
         self._fail(response, "atualizar título e descrição")
 
     def get_video(self, video_id: str) -> dict:
-        response = self.http.get(
+        response = self._request(
+            "GET",
             f"{self.api_base}/library/{self.library_id}/videos/{video_id}",
             headers={"AccessKey": self.api_key, "Accept": "application/json"},
         )
@@ -750,7 +890,15 @@ class BunnyStream:
             raise PublishError("resposta do Bunny sem objeto de vídeo")
         return data
 
-    def upload_file(self, video_id: str, path: Path, *, title: str, resume_url: str = "") -> str:
+    def upload_file(
+        self,
+        video_id: str,
+        path: Path,
+        *,
+        title: str,
+        resume_url: str = "",
+        on_location: Callable[[str], None] | None = None,
+    ) -> str:
         size = path.stat().st_size
         location = resume_url
         offset = 0
@@ -763,6 +911,8 @@ class BunnyStream:
         if not location:
             location = self._create_upload(video_id, size, title)
             offset = 0
+            if on_location:
+                on_location(location)
         with path.open("rb") as handle:
             handle.seek(offset)
             while offset < size:
@@ -784,7 +934,7 @@ class BunnyStream:
         headers = self._auth(video_id)
         headers["Upload-Length"] = str(size)
         headers["Upload-Metadata"] = metadata
-        response = self.http.post(self.tus_endpoint, headers=headers)
+        response = self._request("POST", self.tus_endpoint, headers=headers)
         self._fail(response, "abrir o upload TUS")
         if response.status_code not in {201, 204}:
             raise PublishError(f"TUS recusou a abertura ({response.status_code})")
@@ -796,7 +946,7 @@ class BunnyStream:
         return location
 
     def _head_offset(self, video_id: str, location: str) -> int | None:
-        response = self.http.head(location, headers=self._auth(video_id))
+        response = self._request("HEAD", location, headers=self._auth(video_id))
         if response.status_code == 404:
             return None
         self._fail(response, "retomar o upload")
@@ -812,7 +962,7 @@ class BunnyStream:
         headers = self._auth(video_id)
         headers["Upload-Offset"] = str(offset)
         headers["Content-Type"] = "application/offset+octet-stream"
-        response = self.http.patch(location, headers=headers, content=chunk)
+        response = self._request("PATCH", location, headers=headers, content=chunk)
         self._fail(response, "enviar um trecho")
         if response.status_code not in {204, 200}:
             raise PublishError(f"TUS recusou o trecho ({response.status_code})")
@@ -902,6 +1052,7 @@ def publish_lecture(
     runner: Callable[..., object] | None = None,
     now: Callable[[], int] | None = None,
     dry_run: bool = False,
+    force: bool = False,
 ) -> PublishResult:
     """Sobe o vídeo se o hash ainda não está mapeado, espera a codificação e grava o rascunho."""
     summary = _summary(lecture)
@@ -909,7 +1060,7 @@ def publish_lecture(
         raise PublishError(f"{lecture.video_filename}: aula sem resumo")
     speaker = db.get(Speaker, lecture.speaker_id) if lecture.speaker_id else None
     state = load_state()
-    plan = plan_publish(lecture, speaker, summary, db=db, state=state)
+    plan = plan_publish(lecture, speaker, summary, db=db, state=state, force=force)
     if dry_run:
         return PublishResult("dry-run", detail=render_plan(plan))
     if plan.skip_reason.startswith("já há um"):
@@ -949,6 +1100,7 @@ def publish_lecture(
             chunk_size=settings.publish_chunk_bytes,
             limit_720=settings.publish_transcode_720,
             now=now,
+            sleep=sleep,
         )
         uploaded_now = False
         content_changed = bool(digest and video_id and entry.get("sha256") and entry.get("sha256") != digest)
@@ -963,10 +1115,29 @@ def publish_lecture(
                 if video_id:
                     entry["previous_bunny_video_id"] = video_id
                     log.info("arquivo mudou; o vídeo %s permanece no Bunny e um novo será criado", video_id)
-                video_id = bunny.create_video(draft["title"], description=description)
-                entry["tus_url"] = ""
-                entry["upload_complete"] = False
-                entry["encode_status"] = 0
+                video_id = bunny.create_video(draft["title"])
+                entry.update(
+                    {
+                        "drive_file_id": lecture.drive_file_id,
+                        "sha256": digest,
+                        "source_name": upload_path.name,
+                        "source_mtime_ns": upload_path.stat().st_mtime_ns,
+                        "bunny_video_id": video_id,
+                        "bunny_library_id": settings.bunny_stream_library_id,
+                        "bytes": upload_path.stat().st_size,
+                        "tus_url": "",
+                        "upload_complete": False,
+                        "encode_status": 0,
+                        "status": "created",
+                        "error": "",
+                        "refused_auto_publish": False,
+                    }
+                )
+                _persist(db, lecture, state, entry)
+                try:
+                    bunny.update_video_meta(video_id, title=draft["title"], description=description)
+                except PublishError as exc:
+                    log.warning("descrição do Bunny não gravou para %s: %s", video_id, exc)
             entry.update(
                 {
                     "drive_file_id": lecture.drive_file_id,
@@ -982,11 +1153,18 @@ def publish_lecture(
                 }
             )
             _persist(db, lecture, state, entry)
+
+            def _save_tus(location: str) -> None:
+                entry["tus_url"] = location
+                entry["status"] = "uploading"
+                _persist(db, lecture, state, entry)
+
             location = bunny.upload_file(
                 video_id,
                 upload_path,
                 title=draft["title"],
                 resume_url=str(entry.get("tus_url") or ""),
+                on_location=_save_tus,
             )
             entry["tus_url"] = location
             entry["upload_complete"] = True
@@ -1038,7 +1216,7 @@ def publish_lecture(
             log.info("Bunny %s pronto (%s); %s", video_id, lecture.video_filename, MACHINE_AUTH_MISSING)
             return PublishResult(action, video_id, str(entry.get("mana_lesson_id") or ""), MACHINE_AUTH_MISSING)
 
-        mana = ManaLessons(client, settings.mana_api_url, session)
+        mana = ManaLessons(client, settings.mana_api_url, session, sleep=sleep)
         lesson_id = str(entry.get("mana_lesson_id") or "")
         current: dict | None = None
         if lesson_id:
@@ -1046,10 +1224,21 @@ def publish_lecture(
                 current = mana.get_lesson(lesson_id)
             except PublishError as exc:
                 _fail(db, lecture, state, entry, str(exc))
-            if current and str(current.get("status") or "") == "published":
+            if current and lesson_is_published(current):
                 return _lock_published(db, lecture, state, entry, lesson_id)
             if current is None:
                 lesson_id = ""
+            elif lesson_was_edited(current, entry.get("written_lesson")):
+                entry["status"] = "skipped_edited"
+                entry["error"] = ""
+                _persist(db, lecture, state, entry)
+                log.info("aula %s editada no site; não sobrescrevo", lesson_id)
+                return PublishResult(
+                    "skipped",
+                    str(entry.get("bunny_video_id") or ""),
+                    lesson_id,
+                    "aula editada no site; não alterada",
+                )
 
         if not str(draft.get("speaker_id") or "").strip():
             try:
@@ -1059,26 +1248,27 @@ def publish_lecture(
         reject_unless_draft(draft)
         entry["lesson_payload"] = draft
         entry["lesson_fingerprint"] = lesson_fingerprint(draft)
+        if not lesson_id:
+            entry["status"] = "lesson_pending"
+        _persist(db, lecture, state, entry)
 
         wire = dict(draft)
         youtube_id = str((current or {}).get("youtube_video_id") or "").strip()
         if youtube_id:
             wire["youtube_url"] = f"https://www.youtube.com/watch?v={youtube_id}"
         try:
-            if lesson_id:
-                saved = mana.update_lesson(lesson_id, wire)
-            else:
-                saved = mana.create_lesson(wire)
+            saved = mana.upsert_lesson(lecture.drive_file_id, wire, lesson_id=lesson_id)
         except PublishError as exc:
             _fail(db, lecture, state, entry, str(exc))
         saved_id = str(saved.get("lesson_id") or "")
         saved_status = str(saved.get("status") or "")
-        if saved_status == "published":
+        if lesson_is_published(saved):
             return _lock_published(db, lecture, state, entry, saved_id)
         if saved_status != LESSON_DRAFT:
             _fail(db, lecture, state, entry, f"situação inesperada da aula: {saved_status or 'vazia'}")
         entry["mana_lesson_id"] = saved_id
         entry["lesson_status"] = LESSON_DRAFT
+        entry["written_lesson"] = lesson_view({**wire, "status": saved_status})
         entry["status"] = "synced"
         entry["error"] = ""
         _persist(db, lecture, state, entry)
@@ -1147,6 +1337,7 @@ def publish_pending(
     max_items: int = 1,
     dry_run: bool = False,
     lecture_id: int | None = None,
+    force: bool = False,
 ) -> tuple[int, int, int, int]:
     """Retorna (enviados ao Bunny, aulas sincronizadas, pulados, falhas)."""
     if not dry_run:
@@ -1170,8 +1361,12 @@ def publish_pending(
             continue
         attempted += 1
         try:
-            result = publish_lecture(db, lecture, dry_run=dry_run)
+            result = publish_lecture(db, lecture, dry_run=dry_run, force=force)
         except PublishError as exc:
+            failed += 1
+            log.error("publicação de %s não concluiu: %s", lecture.video_filename, exc)
+            continue
+        except httpx.HTTPError as exc:
             failed += 1
             log.error("publicação de %s não concluiu: %s", lecture.video_filename, exc)
             continue
