@@ -25,6 +25,13 @@ from backend.app.services.hymnal import find_hymn, load_hymns
 from backend.app.services.songlib import find_in_library, load_library, remember_song
 from backend.app.services.songs import SongHit, UnknownSinging, detect_songs
 from backend.app.services.verses import VerseCue, detect_verse_cues, parse_segments
+from backend.app.services.overlay_cards import (
+    OverlayCard,
+    fade_for,
+    output_size,
+    render_hymn_card,
+    render_verse_card,
+)
 
 log = logging.getLogger("bible_notely.overlays")
 
@@ -53,6 +60,10 @@ class Cue:
     kind: str  # verse | lyric
     title: str
     body: str
+    label: str = ""
+    number: str = ""
+    lines: tuple[str, ...] = ()
+    instrumental: bool = False
 
 
 @dataclass
@@ -62,6 +73,7 @@ class OverlayPlan:
     ass_path: Path | None
     token: str
     open_count: int
+    cards: list = None
 
 
 def _as_bool(value: object, default: bool) -> bool:
@@ -129,7 +141,7 @@ def _escape_ass(text: str) -> str:
     return text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
 
 
-def present_body(text: str, width: int = 42, max_lines: int = 4) -> str:
+def wrap_text(text: str, width: int = 42) -> list[str]:
     lines: list[str] = []
     for raw in (text or "").splitlines():
         words = raw.split()
@@ -145,10 +157,82 @@ def present_body(text: str, width: int = 42, max_lines: int = 4) -> str:
                 current = trial
         if current:
             lines.append(current)
-    if len(lines) > max_lines:
-        lines = lines[:max_lines]
-        lines[-1] = lines[-1].rstrip(" .") + "…"
+    return lines
+
+
+def paginate_lines(lines: list[str], max_lines: int = 4) -> list[list[str]]:
+    """Parte o texto em telas sequenciais. Nunca corta com reticências."""
+    if max_lines < 1:
+        max_lines = 1
+    if not lines:
+        return []
+    return [lines[index : index + max_lines] for index in range(0, len(lines), max_lines)]
+
+
+def present_body(text: str, width: int = 42, max_lines: int = 4) -> str:
+    lines = wrap_text(text, width)
     return "\\N".join(_escape_ass(line) for line in lines)
+
+
+def stanza_label(index: int, stanza: str, total: int) -> str:
+    folded = stanza.lower()
+    if folded.startswith("coro") or folded.startswith("refr") or "refrão" in folded[:20]:
+        return "Coro"
+    return f"{index + 1}ª estrofe"
+
+
+def split_verse_pages(body: str, width: int = 42, max_lines: int = 4) -> list[str]:
+    """Telas equilibradas, quebrando de preferência depois de pontuação. Sem '…'."""
+    words = (body or "").split()
+    lines = wrap_text(body, width)
+    pages = max(1, -(-len(lines) // max_lines))
+    if pages == 1:
+        return [" ".join(words)] if words else []
+    total = sum(len(word) + 1 for word in words)
+    target = total / pages
+    result: list[str] = []
+    current: list[str] = []
+    size = 0
+    for index, word in enumerate(words):
+        current.append(word)
+        size += len(word) + 1
+        remaining_pages = pages - len(result) - 1
+        if remaining_pages <= 0:
+            continue
+        near = size >= target * 0.8
+        punct = word.endswith((",", ";", ":", ".", "!", "?"))
+        if (near and punct) or size >= target * 1.15 or len(wrap_text(" ".join(current), width)) > max_lines:
+            if len(wrap_text(" ".join(current), width)) > max_lines:
+                current.pop()
+                result.append(" ".join(current))
+                current = [word]
+                size = len(word) + 1
+            else:
+                result.append(" ".join(current))
+                current = []
+                size = 0
+    if current:
+        result.append(" ".join(current))
+    return [page for page in result if page]
+
+
+def verse_cues_for_span(title: str, body: str, start: float, end: float, max_lines: int = 4) -> list[Cue]:
+    pages = split_verse_pages(body, 42, max_lines)
+    if not pages:
+        return []
+    min_each = 5.0
+    if end - start < min_each * len(pages):
+        end = start + min_each * len(pages)
+    weights = [max(len(page), 20) for page in pages]
+    total = sum(weights)
+    cues: list[Cue] = []
+    cursor = start
+    for index, (page, weight) in enumerate(zip(pages, weights)):
+        piece_end = end if index == len(pages) - 1 else cursor + (end - start) * weight / total
+        lines = tuple(wrap_text(page, 42))
+        cues.append(Cue(start=cursor, end=piece_end, kind="verse", title=title, body="\n".join(lines), lines=lines))
+        cursor = piece_end
+    return cues
 
 
 def render_ass(cues: list[Cue]) -> str:
@@ -185,56 +269,115 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 def cue_token(cues: list[Cue]) -> str:
     if not cues:
         return ""
-    payload = "|".join(f"{cue.kind}:{cue.start:.2f}:{cue.end:.2f}:{cue.title}:{cue.body}" for cue in cues)
+    payload = "nov2026-v1|" + "|".join(
+        f"{cue.kind}:{cue.start:.2f}:{cue.end:.2f}:{cue.title}:{cue.label}:{cue.body}" for cue in cues
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
-def lyric_cues_for_span(title: str, number: str, stanzas: tuple[str, ...] | list[str], start: float, end: float) -> list[Cue]:
-    """Uma faixa por estrofe, no intervalo do canto. Nunca um bloco único com o hino inteiro."""
-    parts = [part.strip() for part in stanzas if part and part.strip()]
-    if not parts:
+def lyric_cues_for_span(
+    title: str,
+    number: str,
+    stanzas: tuple[str, ...] | list[str],
+    start: float,
+    end: float,
+    max_lines: int = 6,
+) -> list[Cue]:
+    """Uma tela por estrofe (ou meia estrofe longa), só no intervalo do canto."""
+    from backend.app.services.hymnal import clean_stanzas
+
+    from backend.app.services.hymnal import stanza_number
+
+    if end <= start:
         return []
-    label = f"CC {number} · {title}" if number else title
-    span = max(end - start, len(parts) * 6)
-    end = start + span
-    weights = [max(len(part), 24) for part in parts]
+    screens: list[tuple[str, tuple[str, ...]]] = []
+    seen: dict[str, str] = {}
+    label = ""
+    for raw in [part for part in stanzas if part and str(part).strip()]:
+        cleaned = clean_stanzas([raw], number, title)
+        if not cleaned:
+            continue
+        marker = stanza_number(raw)
+        text = cleaned[0]
+        if marker is not None:
+            label = f"{marker}ª estrofe"
+        elif text in seen:
+            label = seen[text]
+        elif text.lower().startswith(("coro", "refr")):
+            label = "Coro"
+        seen.setdefault(text, label)
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for page in paginate_lines(lines, max_lines):
+            screens.append((label, tuple(page)))
+    if not screens:
+        return []
+    span = end - start
+    weights = [max(sum(len(line) for line in page), 24) for _, page in screens]
     total = sum(weights) or 1
     cursor = start
     cues: list[Cue] = []
-    for index, (part, weight) in enumerate(zip(parts, weights)):
-        if index == len(parts) - 1:
-            piece_end = end
-        else:
-            piece_end = cursor + max(6.0, span * weight / total)
-        cues.append(Cue(start=cursor, end=piece_end, kind="lyric", title=label, body=part))
+    heading = title
+    for index, ((label, page), weight) in enumerate(zip(screens, weights)):
+        piece_end = end if index == len(screens) - 1 else cursor + span * weight / total
+        cues.append(
+            Cue(
+                start=cursor,
+                end=piece_end,
+                kind="lyric",
+                title=heading,
+                body="\n".join(page),
+                label=label,
+                number=number,
+                lines=page,
+            )
+        )
         cursor = piece_end
     return cues
 
 
-def pack_cues(cues: list[Cue]) -> list[Cue]:
-    """Versículo tem prioridade se cruzar com a letra. Os dois continuam legíveis."""
+def _song_key(cue: Cue) -> str:
+    return f"{cue.number}|{cue.title}"
+
+
+def pack_cues(cues: list[Cue], min_duration: float = 1.5) -> list[Cue]:
+    """Uma tela por vez. Versículo tem prioridade; dois hinos nunca dividem a tela.
+
+    Um hino que cruza outro hino é descartado no trecho em disputa: o hino que
+    começou primeiro fica com o intervalo dele, e o outro só entra depois.
+    """
     ordered = sorted(cues, key=lambda cue: (cue.start, 0 if cue.kind == "verse" else 1))
+    verses = [cue for cue in ordered if cue.kind == "verse"]
+    lyrics = [cue for cue in ordered if cue.kind != "verse"]
+
+    # hinos: um intervalo por música, sem cruzar outra música
+    song_spans: dict[str, tuple[float, float]] = {}
+    for cue in lyrics:
+        key = _song_key(cue)
+        left, right = song_spans.get(key, (cue.start, cue.end))
+        song_spans[key] = (min(left, cue.start), max(right, cue.end))
+    ranked = sorted(song_spans.items(), key=lambda item: item[1][0])
+    accepted: list[tuple[str, float, float]] = []
+    for key, (left, right) in ranked:
+        if any(left < r - 0.2 and l < right - 0.2 for _, l, r in accepted):
+            continue
+        accepted.append((key, left, right))
+    allowed = {key for key, _, _ in accepted}
+    lyrics = [cue for cue in lyrics if _song_key(cue) in allowed]
+
+    merged = sorted([*verses, *lyrics], key=lambda cue: (cue.start, 0 if cue.kind == "verse" else 1))
     packed: list[Cue] = []
-    for cue in ordered:
-        if packed and cue.start < packed[-1].end - 0.2:
-            if packed[-1].kind == "verse" and cue.kind == "lyric":
-                cue = Cue(
-                    start=packed[-1].end,
-                    end=max(cue.end, packed[-1].end + 6),
-                    kind=cue.kind,
-                    title=cue.title,
-                    body=cue.body,
-                )
+    for cue in merged:
+        if packed and cue.start < packed[-1].end - 0.05:
+            previous = packed[-1]
+            if previous.kind == "verse" and cue.kind == "lyric":
+                cue = Cue(**{**cue.__dict__, "start": previous.end})
+            elif cue.kind == "verse":
+                packed[-1] = Cue(**{**previous.__dict__, "end": max(previous.start, cue.start)})
+                if packed[-1].end - packed[-1].start < min_duration:
+                    packed.pop()
             else:
-                previous = packed[-1]
-                packed[-1] = Cue(
-                    start=previous.start,
-                    end=max(previous.start + 2, cue.start),
-                    kind=previous.kind,
-                    title=previous.title,
-                    body=previous.body,
-                )
-        if cue.end - cue.start >= 1.5:
+                cue = Cue(**{**cue.__dict__, "start": previous.end})
+        if cue.end - cue.start >= min_duration:
             packed.append(cue)
     return packed
 
@@ -389,6 +532,10 @@ def _verse_to_cue(item: VerseCue) -> Cue:
     return Cue(start=item.start, end=item.end, kind="verse", title=item.title, body=item.body)
 
 
+def _verse_to_cues(item: VerseCue) -> list[Cue]:
+    return verse_cues_for_span(item.title, item.body, item.start, item.end)
+
+
 def build_plan(
     db: Session,
     lecture: Lecture,
@@ -408,8 +555,9 @@ def build_plan(
     kind = recording_kind(lecture.video_filename or "")
     segments = parse_segments(transcript)
     verses = [
-        _verse_to_cue(item)
+        cue
         for item in detect_verse_cues(transcript, load_passage=load_passage_fn, fetch_chapter=fetch_chapter_fn)
+        for cue in _verse_to_cues(item)
     ]
     hymns = load_hymns(root)
     library = load_library(root)
@@ -436,10 +584,46 @@ def build_plan(
     lyric.extend(_resolved_cues(db, lecture.id, covered))
     cues = pack_cues([*verses, *lyric])
     if not cues or video is None:
-        return OverlayPlan(cues=cues, waiting=False, ass_path=None, token=cue_token(cues), open_count=0)
-    ass_path = video.with_name(f"{video.stem}.overlays.ass")
-    ass_path.write_text(render_ass(cues), encoding="utf-8")
-    return OverlayPlan(cues=cues, waiting=False, ass_path=ass_path, token=cue_token(cues), open_count=0)
+        return OverlayPlan(cues=cues, waiting=False, ass_path=None, token=cue_token(cues), open_count=0, cards=[])
+    from backend.app.services.compress import load_compress_config
+
+    try:
+        max_height = load_compress_config().max_height
+    except Exception:
+        max_height = 0
+    cards = render_cards(cues, video.with_name(f"{video.stem}.overlays"), output_size(video, max_height))
+    return OverlayPlan(cues=cues, waiting=False, ass_path=None, token=cue_token(cues), open_count=0, cards=cards)
+
+
+CARD_STYLE = "nov2026-v1"
+
+
+def render_cards(cues: list[Cue], folder: Path, size: tuple[int, int]) -> list[OverlayCard]:
+    """Um PNG por tela no modelo de novembro. A pasta é refeita a cada plano."""
+    import shutil
+
+    if folder.exists():
+        shutil.rmtree(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    cards: list[OverlayCard] = []
+    for index, cue in enumerate(cues):
+        dest = folder / f"{index:03d}-{cue.kind}.png"
+        if cue.kind == "verse":
+            render_verse_card(dest, reference=cue.title, text=" ".join(cue.lines) if cue.lines else cue.body, size=size)
+        else:
+            lines = list(cue.lines) or [line for line in cue.body.splitlines() if line.strip()]
+            render_hymn_card(
+                dest,
+                number=cue.number,
+                title=cue.title,
+                label=cue.label,
+                lines=lines,
+                instrumental=cue.instrumental,
+                size=size,
+            )
+        fade_in, fade_out = fade_for(cue.kind, cue.end - cue.start)
+        cards.append(OverlayCard(path=dest, start=cue.start, end=cue.end, fade_in=fade_in, fade_out=fade_out, kind=cue.kind))
+    return cards
 
 
 def resolve_pending(
@@ -582,6 +766,7 @@ def run_lecture_overlay(
                     config=config,
                     ass_path=plan.ass_path,
                     overlay_token=plan.token,
+                    cards=plan.cards or None,
                 )
                 return f"{result.status} versos_e_letras={len(plan.cues)} perfil={result.profile}"
         sleeper(2)

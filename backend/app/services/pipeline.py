@@ -198,6 +198,7 @@ async def _compress_stage(
     *,
     ass_path: Path | None = None,
     overlay_token: str = "",
+    cards: list | None = None,
 ) -> None:
     set_pipeline(stage="compress", progress=0, message=f"Comprimindo {lecture.video_filename}")
     lecture.status = "compressing"
@@ -221,6 +222,7 @@ async def _compress_stage(
         cancel=cancel_event,
         ass_path=ass_path,
         overlay_token=overlay_token,
+        cards=cards,
     )
     set_pipeline(progress=None)
     if result.status == "missing":
@@ -597,7 +599,7 @@ async def process_one(
                     no_wait=False,
                 )
             else:
-                plan = OverlayPlan(cues=[], waiting=False, ass_path=None, token="", open_count=0)
+                plan = OverlayPlan(cues=[], waiting=False, ass_path=None, token="", open_count=0, cards=[])
             if plan.waiting:
                 lecture.status = "awaiting_lyrics"
                 _touch(lecture)
@@ -614,6 +616,7 @@ async def process_one(
                 video_path,
                 ass_path=plan.ass_path,
                 overlay_token=plan.token,
+                cards=plan.cards or None,
             )
 
         if held_for_review:

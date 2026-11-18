@@ -260,12 +260,45 @@ def compose_video_filter(max_height: int, ass_path: Path | None = None) -> str |
     return ",".join(parts) if parts else None
 
 
+def card_filter_graph(cards: list, max_height: int = 0) -> tuple[list[str], str]:
+    """PNG por cue + overlay, como no culto de novembro. Uma tela por vez, com fade."""
+    inputs: list[str] = []
+    chains: list[str] = []
+    base = "0:v"
+    scale = scale_filter(max_height)
+    if scale:
+        chains.append(f"[0:v]{scale}[base]")
+        base = "base"
+    last = base
+    for index, card in enumerate(cards, start=1):
+        start = float(card.start)
+        end = float(card.end)
+        duration = max(end - start, 0.1)
+        fade_in = min(float(card.fade_in), duration / 3)
+        fade_out = min(float(card.fade_out), duration / 3)
+        inputs += ["-loop", "1", "-framerate", "30", "-t", f"{duration:.3f}", "-i", str(card.path)]
+        chains.append(
+            f"[{index}:v]format=rgba,"
+            f"fade=in:st=0:d={fade_in:.2f}:alpha=1,"
+            f"fade=out:st={max(duration - fade_out, 0):.2f}:d={fade_out:.2f}:alpha=1,"
+            f"setpts=PTS+{start:.3f}/TB[o{index}]"
+        )
+        out = f"v{index}"
+        chains.append(
+            f"[{last}][o{index}]overlay=0:0:eof_action=pass:enable='between(t,{start:.3f},{end:.3f})'[{out}]"
+        )
+        last = out
+    chains.append(f"[{last}]null[vout]")
+    return inputs, ";".join(chains)
+
+
 def build_ffmpeg_command(
     source: Path,
     dest: Path,
     config: CompressConfig,
     ass_path: Path | None = None,
     overlay_token: str = "",
+    cards: list | None = None,
 ) -> list[str]:
     config = validate_config(config)
     cmd = [
@@ -286,9 +319,16 @@ def build_ffmpeg_command(
         "-pix_fmt",
         "yuv420p",
     ]
-    vf = compose_video_filter(config.max_height, ass_path)
-    if vf:
-        cmd += ["-vf", vf]
+    if cards:
+        inputs, graph = card_filter_graph(cards, config.max_height)
+        insert_at = cmd.index("-map")
+        cmd[insert_at:insert_at] = inputs + ["-filter_complex", graph]
+        map_index = cmd.index("0:v:0")
+        cmd[map_index] = "[vout]"
+    else:
+        vf = compose_video_filter(config.max_height, ass_path)
+        if vf:
+            cmd += ["-vf", vf]
     if config.codec == "h265":
         cmd += ["-tag:v", "hvc1"]
     if config.audio == "aac":
@@ -328,8 +368,9 @@ def _run_ffmpeg(
     cancel: Event | None = None,
     ass_path: Path | None = None,
     overlay_token: str = "",
+    cards: list | None = None,
 ) -> None:
-    cmd = build_ffmpeg_command(source, dest, config, ass_path=ass_path, overlay_token=overlay_token)
+    cmd = build_ffmpeg_command(source, dest, config, ass_path=ass_path, overlay_token=overlay_token, cards=cards)
     log.info("ffmpeg %s", " ".join(cmd))
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -480,6 +521,7 @@ def compress_file(
     reuse: bool = False,
     ass_path: Path | None = None,
     overlay_token: str = "",
+    cards: list | None = None,
 ) -> CompressResult:
     """Encode para um arquivo ao lado do original. Não apaga a origem.
 
@@ -514,6 +556,7 @@ def compress_file(
             cancel,
             ass_path=ass_path,
             overlay_token=overlay_token,
+            cards=cards,
         )
         ok, reason = durations_match(source, partial, config.duration_tolerance)
         if not ok:
@@ -603,6 +646,7 @@ def compress_lecture(
     upload: Callable[[Path, str], str] | None = None,
     ass_path: Path | None = None,
     overlay_token: str | None = None,
+    cards: list | None = None,
 ) -> CompressResult:
     """Comprime, confere, grava o SQLite e só então apaga ou envia, se pedido."""
     config = validate_config(config or load_compress_config())
@@ -636,6 +680,7 @@ def compress_lecture(
             reuse=False,
             ass_path=ass_path,
             overlay_token=overlay_token or "",
+            cards=cards,
         )
         assert result.output is not None
         lecture.original_size = result.original_size

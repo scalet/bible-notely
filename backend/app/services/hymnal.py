@@ -32,6 +32,58 @@ _STANZA = re.compile(r"(?i)^(?:coro|refr[aã]o|chorus|est(?:rofe)?\.?\s*\d+|\d{1
 _NUMBER_QUERY = re.compile(r"(?i)^(?:hino|n[oº°]?\.?|cc|cantor(?:\s+cristao)?)?\s*(\d{1,4})\s*$")
 
 
+
+_SLIDE_TITLE = re.compile(r"^\d{1,4}\s*[-–—]\s*[“\"«].*[”\"»]\s*$")
+_STROPH_MARK = re.compile(r"^(?:\d{1,2}\s*\.{1,2}|[•●])\s*")
+
+
+def is_slide_chrome(line: str, number: str = "", title: str = "") -> bool:
+    """Título e número que vêm dos slides .pps, não fazem parte da letra."""
+    stripped = (line or "").strip()
+    if not stripped:
+        return False
+    if _HEADER.match(stripped) or _SLIDE_TITLE.match(stripped):
+        return True
+    if number and fold(stripped) in {
+        fold(f"{number} {title}"),
+        fold(f"{number} - {title}"),
+        fold(f"{number} – {title}"),
+        fold(title),
+    }:
+        return True
+    return False
+
+
+def stanza_number(stanza: str) -> int | None:
+    """Número da estrofe pelo marcador do slide ('2..'), se houver."""
+    for raw in str(stanza).splitlines():
+        match = re.match(r"^\s*(\d{1,2})\s*\.{1,2}\s*\S", raw)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def clean_lyric_line(line: str) -> str:
+    """Tira '2..', '1.' e bullets na frente da linha da estrofe."""
+    return _STROPH_MARK.sub("", (line or "").strip()).strip()
+
+
+def clean_stanzas(stanzas: tuple[str, ...] | list[str], number: str = "", title: str = "") -> tuple[str, ...]:
+    """Letra só, sem restos de slide (título entre aspas, número, marcador de estrofe)."""
+    cleaned: list[str] = []
+    for stanza in stanzas:
+        lines = []
+        for raw in str(stanza).replace("\r\n", "\n").split("\n"):
+            if is_slide_chrome(raw, number, title):
+                continue
+            line = clean_lyric_line(raw)
+            if line:
+                lines.append(line)
+        if lines:
+            cleaned.append("\n".join(lines))
+    return tuple(cleaned)
+
+
 class HymnalError(RuntimeError):
     pass
 
@@ -171,11 +223,11 @@ def load_hymns(root: Path | None = None) -> list[SongText]:
         return []
     hymns: list[SongText] = []
     for item in raw.get("hymns") or []:
+        number = str(item.get("number") or "")
+        title = str(item.get("title") or (f"Hino {number}" if number else "Hino"))
         stanzas = tuple(str(part).strip() for part in item.get("stanzas") or [] if str(part).strip())
         if not stanzas:
             continue
-        number = str(item.get("number") or "")
-        title = str(item.get("title") or (f"Hino {number}" if number else "Hino"))
         key = f"cc:{number}" if number else f"cc:{fold(title)}"
         hymns.append(SongText(key=key, number=number, title=title, stanzas=stanzas, source="cantor"))
     return hymns
