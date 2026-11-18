@@ -21,8 +21,12 @@ MIN_LINE_TOKEN_RATIO = 0.6
 COMMON_SHARE = 0.03  # palavra em mais de 3% dos hinos (deus, senhor, jesus...) não prova nada
 MUSIC_GAP = 8.0  # segundos sem fala na transcrição: o Whisper costuma calar durante o canto
 _ANNOUNCE = re.compile(r"hino\s+(?:de\s+)?(?:numero\s+|n\s*)?(\d{1,3})\b")
-_COMMON: set[str] = set()
-_SHARED_LINES: set[str] = set()
+
+
+@dataclass(frozen=True)
+class SongLexicon:
+    common: frozenset[str] = frozenset()
+    shared_lines: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -65,17 +69,21 @@ def _line_key(tokens: list[str] | str) -> str:
     return " ".join(tokens)
 
 
-def _is_shared_line(tokens: list[str]) -> bool:
-    return _line_key(tokens) in _SHARED_LINES
+def _is_shared_line(tokens: list[str], lexicon: SongLexicon) -> bool:
+    return _line_key(tokens) in lexicon.shared_lines
 
 
-def _lyric_lines(stanzas: tuple[str, ...] | list[str], rare_only: bool = True) -> list[list[str]]:
+def _lyric_lines(
+    stanzas: tuple[str, ...] | list[str],
+    lexicon: SongLexicon,
+    rare_only: bool = True,
+) -> list[list[str]]:
     """Linhas distintas com 2+ palavras raras (refrão repetido conta uma vez)."""
     seen: set[str] = set()
     lines: list[list[str]] = []
     for stanza in stanzas:
         for line in str(stanza).splitlines():
-            tokens = [token for token in content_tokens(line) if not (rare_only and token in _COMMON)]
+            tokens = [token for token in content_tokens(line) if not (rare_only and token in lexicon.common)]
             if len(tokens) < 2:
                 continue
             key = " ".join(tokens)
@@ -86,11 +94,16 @@ def _lyric_lines(stanzas: tuple[str, ...] | list[str], rare_only: bool = True) -
     return lines
 
 
-def _line_hits(window_tokens: set[str], stanzas: tuple[str, ...] | list[str], rare_only: bool = True) -> int:
+def _line_hits(
+    window_tokens: set[str],
+    stanzas: tuple[str, ...] | list[str],
+    lexicon: SongLexicon,
+    rare_only: bool = True,
+) -> int:
     """Quantas linhas distintas e não compartilhadas da letra batem no trecho."""
     hits = 0
-    for tokens in _lyric_lines(stanzas, rare_only):
-        if _is_shared_line(tokens):
+    for tokens in _lyric_lines(stanzas, lexicon, rare_only):
+        if _is_shared_line(tokens, lexicon):
             continue
         unique = set(tokens)
         needed = len(unique) if len(unique) < 3 else max(3, int(MIN_LINE_TOKEN_RATIO * len(unique) + 0.999))
@@ -99,12 +112,17 @@ def _line_hits(window_tokens: set[str], stanzas: tuple[str, ...] | list[str], ra
     return hits
 
 
-def _lines_in_order(window_text: str, stanzas: tuple[str, ...] | list[str], rare_only: bool = True) -> bool:
+def _lines_in_order(
+    window_text: str,
+    stanzas: tuple[str, ...] | list[str],
+    lexicon: SongLexicon,
+    rare_only: bool = True,
+) -> bool:
     """Pelo menos dois versos da letra aparecem na ordem, palavra após palavra."""
     haystack = content_tokens(window_text)
     matched = 0
-    for needle in _lyric_lines(stanzas, rare_only):
-        if _is_shared_line(needle):
+    for needle in _lyric_lines(stanzas, lexicon, rare_only):
+        if _is_shared_line(needle, lexicon):
             continue
         if _find_seq(haystack, needle) is not None:
             matched += 1
@@ -141,6 +159,7 @@ def _best_song(
     songs: list[SongText],
     postings: dict[str, set[int]],
     per_song: list[list[set[str]]],
+    lexicon: SongLexicon,
     announced: set[str] | None = None,
 ) -> tuple[SongText, int, float, int] | None:
     unique = set(tokens)
@@ -157,11 +176,11 @@ def _best_song(
         song = songs[index]
         stanzas = clean_stanzas(song.stanzas, song.number, song.title)
         is_announced = bool(announced and song.number and song.number in announced)
-        line_hits = _line_hits(unique, stanzas)
-        ordered = line_hits >= MIN_LINE_HITS and _lines_in_order(window_text, stanzas)
+        line_hits = _line_hits(unique, stanzas, lexicon)
+        ordered = line_hits >= MIN_LINE_HITS and _lines_in_order(window_text, stanzas, lexicon)
         if not ordered and is_announced:
-            line_hits = _line_hits(unique, stanzas, rare_only=False)
-            ordered = line_hits >= MIN_LINE_HITS and _lines_in_order(window_text, stanzas, rare_only=False)
+            line_hits = _line_hits(unique, stanzas, lexicon, rare_only=False)
+            ordered = line_hits >= MIN_LINE_HITS and _lines_in_order(window_text, stanzas, lexicon, rare_only=False)
         if not ordered:
             continue
         stanza_index = 0
@@ -217,8 +236,15 @@ def _looks_sung(group) -> bool:
     return _looks_sung_text(text, duration)
 
 
-def stanzas_for_span(song: SongText, span: float, best_index: int, window_tokens: set[str] | None = None) -> tuple[str, ...]:
+def stanzas_for_span(
+    song: SongText,
+    span: float,
+    best_index: int,
+    window_tokens: set[str] | None = None,
+    lexicon: SongLexicon | None = None,
+) -> tuple[str, ...]:
     """Só os slides/estrofes que de fato aparecem no trecho cantado (texto bruto; a tela limpa depois)."""
+    lexicon = lexicon or SongLexicon()
     raw = tuple(stanza for stanza in song.stanzas if clean_stanzas([stanza], song.number, song.title))
     if not raw:
         return ()
@@ -226,7 +252,7 @@ def stanzas_for_span(song: SongText, span: float, best_index: int, window_tokens
         matched = [
             stanza
             for stanza in raw
-            if _line_hits(window_tokens, clean_stanzas([stanza], song.number, song.title), rare_only=False) >= MIN_LINE_HITS
+            if _line_hits(window_tokens, clean_stanzas([stanza], song.number, song.title), lexicon, rare_only=False) >= MIN_LINE_HITS
         ]
         if matched:
             first = raw.index(matched[0])
@@ -283,8 +309,7 @@ def _announced_numbers(segments, start: float, end: float) -> set[str]:
     return {str(int(match.group(1))) for match in _ANNOUNCE.finditer(fold(text))}
 
 
-def _set_common(catalog: list[SongText]) -> None:
-    global _COMMON, _SHARED_LINES
+def _lexicon(catalog: list[SongText]) -> SongLexicon:
     df: dict[str, int] = {}
     line_df: dict[str, int] = {}
     for song in catalog:
@@ -299,9 +324,10 @@ def _set_common(catalog: list[SongText]) -> None:
                 seen.add(key)
                 line_df[key] = line_df.get(key, 0) + 1
     limit = max(3, int(len(catalog) * COMMON_SHARE))
-    _COMMON = {token for token, count in df.items() if count > limit} if len(catalog) >= 50 else set()
+    common = {token for token, count in df.items() if count > limit} if len(catalog) >= 50 else set()
     # Refrão que aparece em 3+ hinos não prova o cântico sozinho.
-    _SHARED_LINES = {key for key, count in line_df.items() if count >= 3} if len(catalog) >= 8 else set()
+    shared = {key for key, count in line_df.items() if count >= 3} if len(catalog) >= 8 else set()
+    return SongLexicon(common=frozenset(common), shared_lines=frozenset(shared))
 
 
 def _covered(start: float, end: float, intervals: list[tuple[float, float]]) -> bool:
@@ -335,7 +361,7 @@ def detect_songs(segments, hymns: list[SongText], library: list[dict]) -> tuple[
     if not segments:
         return [], []
     catalog = [*hymns, *library_songs(library)]
-    _set_common(catalog)
+    lexicon = _lexicon(catalog)
     postings, per_song = _index(catalog)
     raw: list[tuple[float, float, SongText, int, float, int, set[str]]] = []
     suppressed: list[tuple[float, float]] = []
@@ -350,9 +376,9 @@ def detect_songs(segments, hymns: list[SongText], library: list[dict]) -> tuple[
         if learned is not None:
             song = _song_from_entry(learned)
             if song is not None:
-                raw.append((start, end, song, 0, 1.0, max(_line_hits(set(tokens), song.stanzas), 2), set(tokens)))
+                raw.append((start, end, song, 0, 1.0, max(_line_hits(set(tokens), song.stanzas, lexicon), 2), set(tokens)))
                 continue
-        found = _best_song(tokens, text, catalog, postings, per_song, _announced_numbers(segments, start, end))
+        found = _best_song(tokens, text, catalog, postings, per_song, lexicon, _announced_numbers(segments, start, end))
         if found is not None:
             song, stanza_index, score, line_hits = found
             raw.append((start, end, song, stanza_index, score, line_hits, set(tokens)))
@@ -382,7 +408,7 @@ def detect_songs(segments, hymns: list[SongText], library: list[dict]) -> tuple[
     hits: list[SongHit] = []
     covered: list[tuple[float, float]] = list(suppressed)
     for start, end, song, stanza_index, score, line_hits, tokens in merged:
-        stanzas = stanzas_for_span(song, end - start, stanza_index, tokens)
+        stanzas = stanzas_for_span(song, end - start, stanza_index, tokens, lexicon)
         if not stanzas:
             continue
         hits.append(

@@ -15,6 +15,7 @@ import logging
 import time
 import unicodedata
 from collections.abc import Callable
+from urllib.parse import quote
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -59,6 +60,15 @@ class PublishError(RuntimeError):
     pass
 
 
+class LessonConflict(PublishError):
+    """409 do Maná: aula publicada ou editada por uma pessoa."""
+
+    def __init__(self, reason: str, lesson_id: str = "", detail: str = "") -> None:
+        self.reason = reason
+        self.lesson_id = lesson_id
+        super().__init__(detail or f"aula em conflito ({reason})")
+
+
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 DEFAULT_RETRIES = 3
 
@@ -87,7 +97,13 @@ def request_with_retry(
             delay *= 2
             continue
         if response.status_code in RETRY_STATUSES and attempt < attempts - 1:
-            sleep(delay)
+            wait = delay
+            raw = response.headers.get("Retry-After") or response.headers.get("retry-after") or ""
+            try:
+                wait = max(0.0, float(raw.strip()))
+            except ValueError:
+                wait = delay
+            sleep(wait)
             delay *= 2
             continue
         return response
@@ -526,6 +542,7 @@ def lesson_fingerprint(payload: dict) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+LESSON_WIRE_FIELDS = ("title", "date", "type", "speaker_id", "verses", "body", "bunny_video_id")
 _LESSON_GUARD_FIELDS = ("title", "date", "type", "speaker_id", "verses", "body", "status")
 
 
@@ -563,6 +580,29 @@ def lesson_was_edited(current: dict | None, last_written: dict | None) -> bool:
 def lesson_is_published(data: dict | None) -> bool:
     status = str((data or {}).get("status") or "").strip().lower()
     return status in {"published", "publicada", "publicado"}
+
+
+def lesson_wire(payload: dict) -> dict:
+    """Campos aceitos no PUT /api/pipeline/lessons/{drive_file_id}."""
+    return {key: payload[key] for key in LESSON_WIRE_FIELDS if key in payload}
+
+
+def _conflict_reason(response: httpx.Response) -> str | None:
+    if response.status_code != 409:
+        return None
+    blob = ""
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        blob = " ".join(str(data.get(key) or "") for key in ("error", "code", "reason", "detail", "status", "message"))
+    blob = (blob or response.text or "").lower()
+    if "published" in blob or "publicada" in blob or "publicado" in blob:
+        return "published"
+    if "edited" in blob or "editada" in blob or "editado" in blob:
+        return "edited"
+    return "edited"
 
 
 def empty_state() -> dict:
@@ -669,6 +709,9 @@ class ManaLessons:
         self.use_pipeline = settings.mana_pipeline_lessons if use_pipeline is None else use_pipeline
         self.sleep = sleep
 
+    def _pipeline_url(self, drive_file_id: str) -> str:
+        return f"{self.origin}{self.PIPELINE_LESSONS}/{quote(drive_file_id, safe='')}"
+
     def _headers(self, drive_file_id: str = "") -> dict[str, str]:
         headers = {
             "Authorization": f"Bearer {self.token}",
@@ -679,8 +722,8 @@ class ManaLessons:
             headers["Idempotency-Key"] = drive_file_id
         return headers
 
-    def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
-        return request_with_retry(self.http, method, url, sleep=self.sleep, **kwargs)
+    def _request(self, method: str, url: str, *, retries: int = DEFAULT_RETRIES, **kwargs) -> httpx.Response:
+        return request_with_retry(self.http, method, url, retries=retries, sleep=self.sleep, **kwargs)
 
     def _data(self, response: httpx.Response, action: str) -> object:
         if response.status_code >= 400:
@@ -711,12 +754,24 @@ class ManaLessons:
         reject_unless_draft(payload)
         if not str(payload.get("speaker_id") or "").strip():
             raise PublishError("speaker_id obrigatório")
-        response = self._request(
-            "POST",
-            f"{self.origin}{self.ADMIN_LESSONS}",
-            headers=self._headers(drive_file_id),
-            json=payload,
-        )
+        url = f"{self.origin}{self.ADMIN_LESSONS}"
+        try:
+            response = self._request(
+                "POST",
+                url,
+                retries=1,
+                headers=self._headers(drive_file_id),
+                json=payload,
+            )
+        except PublishError:
+            found = self.find_lesson_by_bunny_video_id(str(payload.get("bunny_video_id") or ""))
+            if found:
+                return found
+            raise
+        if response.status_code >= 400:
+            found = self.find_lesson_by_bunny_video_id(str(payload.get("bunny_video_id") or ""))
+            if found:
+                return found
         return self._lesson(self._data(response, "criar a aula"))
 
     def update_lesson(self, lesson_id: str, payload: dict, drive_file_id: str = "") -> dict:
@@ -741,16 +796,64 @@ class ManaLessons:
             return self.update_lesson(lesson_id, payload, drive_file_id=drive_file_id)
         return self.create_lesson(payload, drive_file_id=drive_file_id)
 
+    def get_pipeline_lesson(self, drive_file_id: str) -> dict | None:
+        response = self._request("GET", self._pipeline_url(drive_file_id), headers=self._headers(drive_file_id))
+        if response.status_code == 404:
+            return None
+        data = self._data(response, "ler a aula")
+        if not isinstance(data, dict):
+            raise PublishError("Maná devolveu uma aula inválida")
+        return data
+
+    def list_lessons(self) -> list[dict]:
+        response = self._request("GET", f"{self.origin}{self.ADMIN_LESSONS}", headers=self._headers())
+        if response.status_code == 404:
+            return []
+        data = self._data(response, "listar aulas")
+        if isinstance(data, list):
+            rows = data
+        elif isinstance(data, dict):
+            rows = data.get("items") or data.get("lessons") or data.get("data") or []
+        else:
+            raise PublishError("Maná devolveu a lista de aulas inválida")
+        return [row for row in rows if isinstance(row, dict)]
+
+    def find_lesson_by_bunny_video_id(self, bunny_video_id: str) -> dict | None:
+        wanted = str(bunny_video_id or "").strip()
+        if not wanted:
+            return None
+        for row in self.list_lessons():
+            if str(row.get("bunny_video_id") or "").strip() == wanted:
+                try:
+                    return self._lesson(row)
+                except PublishError:
+                    lesson_id = str(row.get("lesson_id") or "").strip()
+                    if not lesson_id:
+                        continue
+                    fetched = self.get_lesson(lesson_id)
+                    return fetched
+        return None
+
     def _put_pipeline(self, drive_file_id: str, payload: dict) -> dict:
         reject_unless_draft(payload)
         if not str(payload.get("speaker_id") or "").strip():
             raise PublishError("speaker_id obrigatório")
         response = self._request(
             "PUT",
-            f"{self.origin}{self.PIPELINE_LESSONS}/{drive_file_id}",
+            self._pipeline_url(drive_file_id),
             headers=self._headers(drive_file_id),
-            json=payload,
+            json=lesson_wire(payload),
         )
+        reason = _conflict_reason(response)
+        if reason:
+            data = {}
+            try:
+                parsed = response.json()
+                if isinstance(parsed, dict):
+                    data = parsed
+            except ValueError:
+                data = {}
+            raise LessonConflict(reason, str(data.get("lesson_id") or ""), _redact(response.text, [self.token]))
         return self._lesson(self._data(response, "gravar a aula"))
 
     def _lesson(self, data: object) -> dict:
@@ -818,8 +921,8 @@ class BunnyStream:
         self._now = now or (lambda: int(time.time()))
         self.sleep = sleep
 
-    def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
-        return request_with_retry(self.http, method, url, sleep=self.sleep, **kwargs)
+    def _request(self, method: str, url: str, *, retries: int = DEFAULT_RETRIES, **kwargs) -> httpx.Response:
+        return request_with_retry(self.http, method, url, retries=retries, sleep=self.sleep, **kwargs)
 
     def _auth(self, video_id: str) -> dict[str, str]:
         expiration = self._now() + 86400
@@ -841,22 +944,95 @@ class BunnyStream:
         detail = _redact(response.text, [self.api_key])
         raise PublishError(f"Bunny falhou ao {action} ({response.status_code}): {detail}")
 
-    def create_video(self, title: str) -> str:
-        """CreateVideoModel aceita só title (e opcionalmente collectionId/thumbnailTime)."""
-        response = self._request(
-            "POST",
-            f"{self.api_base}/library/{self.library_id}/videos",
-            headers={"AccessKey": self.api_key, "Accept": "application/json"},
-            json={"title": title},
-        )
-        self._fail(response, "criar o vídeo")
+    def create_video(self, title: str, exclude_ids: list[str] | tuple[str, ...] = ()) -> str:
+        """CreateVideoModel aceita só title (e opcionalmente collectionId/thumbnailTime).
+
+        O POST de criação não é repetido: um timeout ou 503 depois de o Bunny
+        já ter criado o vídeo geraria outro GUID. Em falha, tenta adotar um
+        vídeo existente com o mesmo título.
+        """
+        url = f"{self.api_base}/library/{self.library_id}/videos"
+        headers = {"AccessKey": self.api_key, "Accept": "application/json"}
+        try:
+            response = self._request("POST", url, retries=1, headers=headers, json={"title": title})
+        except PublishError:
+            found = self.find_video_by_title(title, exclude_ids=exclude_ids)
+            if found:
+                return found
+            raise
+        if response.status_code >= 400:
+            found = self.find_video_by_title(title, exclude_ids=exclude_ids)
+            if found:
+                return found
+            self._fail(response, "criar o vídeo")
         try:
             guid = str(response.json().get("guid") or "")
         except ValueError as exc:
+            found = self.find_video_by_title(title, exclude_ids=exclude_ids)
+            if found:
+                return found
             raise PublishError("Bunny não devolveu JSON ao criar o vídeo") from exc
         if not guid:
+            found = self.find_video_by_title(title, exclude_ids=exclude_ids)
+            if found:
+                return found
             raise PublishError("Bunny não devolveu guid")
         return guid
+
+    def find_video_by_title(self, title: str, exclude_ids: list[str] | tuple[str, ...] = ()) -> str:
+        """Adota um vídeo já criado com o mesmo título, se for viável."""
+        wanted = (title or "").strip()
+        if not wanted:
+            return ""
+        response = self._request(
+            "GET",
+            f"{self.api_base}/library/{self.library_id}/videos",
+            headers={"AccessKey": self.api_key, "Accept": "application/json"},
+            params={"page": 1, "itemsPerPage": 100, "search": wanted},
+        )
+        if response.status_code >= 400:
+            self._fail(response, "listar vídeos")
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise PublishError("Bunny não devolveu JSON ao listar vídeos") from exc
+        items = data if isinstance(data, list) else (data.get("items") if isinstance(data, dict) else None)
+        if not isinstance(items, list):
+            return ""
+        viable: list[tuple[str, int]] = []
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("title") or "").strip() != wanted:
+                continue
+            guid = str(row.get("guid") or "").strip()
+            if not guid or guid in set(filter(None, exclude_ids)):
+                continue
+            try:
+                status = int(row.get("status") or 0)
+            except (TypeError, ValueError):
+                status = 0
+            if status in FAILED_STATUSES:
+                continue
+            viable.append((guid, status))
+        if len(viable) == 1:
+            log.info("adotei o vídeo Bunny %s com o título já existente", viable[0][0])
+            return viable[0][0]
+        preferred = [item for item in viable if item[1] in ENCODED_STATUSES or item[1] in {0, 1, 2, 3}]
+        if len(preferred) == 1:
+            log.info("adotei o vídeo Bunny %s com o título já existente", preferred[0][0])
+            return preferred[0][0]
+        return ""
+
+    def confirm_video(self, video_id: str, title: str) -> str:
+        """Confirma um GUID pendente ou adota um vídeo com o mesmo título."""
+        if video_id:
+            try:
+                self.get_video(video_id)
+                return video_id
+            except PublishError:
+                log.warning("GUID pendente %s não confirmado no Bunny; busco pelo título", video_id)
+        return self.find_video_by_title(title, exclude_ids=())
 
     def update_video_meta(self, video_id: str, *, title: str = "", description: str = "") -> None:
         """UpdateVideoModel não tem description; a descrição vai em metaTags.property=description."""
@@ -1082,7 +1258,8 @@ def publish_lecture(
         lesson_ready = bool(entry.get("mana_lesson_id")) and entry.get("lesson_fingerprint") == fingerprint
         if not settings.mana_publish_enabled:
             lesson_ready = True
-        if entry.get("upload_complete") and encoded and lesson_ready and not entry.get("refused_auto_publish"):
+        meta_ready = bool(entry.get("meta_updated"))
+        if entry.get("upload_complete") and encoded and lesson_ready and not entry.get("refused_auto_publish") and meta_ready:
             return PublishResult("skipped", video_id, str(entry.get("mana_lesson_id") or ""), "já mapeado")
 
     if upload_path is None and not (video_id and entry.get("upload_complete")):
@@ -1111,11 +1288,24 @@ def publish_lecture(
             if upload_path is None:
                 raise PublishError(f"vídeo processado não encontrado para {lecture.video_filename}")
             resume_same = bool(video_id and entry.get("sha256") == digest and not entry.get("upload_complete"))
+            if resume_same and video_id:
+                confirmed = bunny.confirm_video(video_id, draft["title"])
+                if confirmed:
+                    video_id = confirmed
+                    entry["bunny_video_id"] = video_id
+                    _persist(db, lecture, state, entry)
+                else:
+                    resume_same = False
+                    video_id = ""
             if not resume_same:
+                exclude_ids = []
                 if video_id:
                     entry["previous_bunny_video_id"] = video_id
+                    exclude_ids.append(video_id)
                     log.info("arquivo mudou; o vídeo %s permanece no Bunny e um novo será criado", video_id)
-                video_id = bunny.create_video(draft["title"])
+                if entry.get("previous_bunny_video_id"):
+                    exclude_ids.append(str(entry["previous_bunny_video_id"]))
+                video_id = bunny.create_video(draft["title"], exclude_ids=exclude_ids)
                 entry.update(
                     {
                         "drive_file_id": lecture.drive_file_id,
@@ -1131,12 +1321,17 @@ def publish_lecture(
                         "status": "created",
                         "error": "",
                         "refused_auto_publish": False,
+                        "meta_updated": False,
                     }
                 )
                 _persist(db, lecture, state, entry)
                 try:
                     bunny.update_video_meta(video_id, title=draft["title"], description=description)
+                    entry["meta_updated"] = True
+                    _persist(db, lecture, state, entry)
                 except PublishError as exc:
+                    entry["meta_updated"] = False
+                    _persist(db, lecture, state, entry)
                     log.warning("descrição do Bunny não gravou para %s: %s", video_id, exc)
             entry.update(
                 {
@@ -1174,6 +1369,16 @@ def publish_lecture(
             uploaded_now = True
             encoded = False
 
+        if video_id and description and not entry.get("meta_updated"):
+            try:
+                bunny.update_video_meta(video_id, title=draft["title"], description=description)
+                entry["meta_updated"] = True
+                _persist(db, lecture, state, entry)
+            except PublishError as exc:
+                entry["meta_updated"] = False
+                _persist(db, lecture, state, entry)
+                log.warning("descrição do Bunny não gravou para %s: %s", video_id, exc)
+
         if encoded and int(entry.get("encode_status") or 0) in ENCODED_STATUSES and not uploaded_now:
             video = {"status": int(entry["encode_status"]), "guid": video_id}
         else:
@@ -1207,38 +1412,44 @@ def publish_lecture(
             log.info("Bunny %s pronto (%s); %s", video_id, lecture.video_filename, detail)
             return PublishResult(action, video_id, str(entry.get("mana_lesson_id") or ""), detail)
 
-        session = settings.mana_session_token.strip()
-        if not session or not settings.mana_api_url.strip():
+        use_pipeline = bool(settings.mana_pipeline_lessons)
+        if use_pipeline:
+            token = settings.mana_pipeline_token.strip()
+            missing = "MANA_PIPELINE_TOKEN é obrigatório quando MANA_PIPELINE_LESSONS está ligado"
+        else:
+            token = settings.mana_session_token.strip()
+            missing = MACHINE_AUTH_MISSING
+        if not token or not settings.mana_api_url.strip():
             entry["lesson_payload"] = draft
             entry["status"] = "bunny_ready"
-            entry["error"] = MACHINE_AUTH_MISSING
+            entry["error"] = missing
             _persist(db, lecture, state, entry)
-            log.info("Bunny %s pronto (%s); %s", video_id, lecture.video_filename, MACHINE_AUTH_MISSING)
-            return PublishResult(action, video_id, str(entry.get("mana_lesson_id") or ""), MACHINE_AUTH_MISSING)
+            log.info("Bunny %s pronto (%s); %s", video_id, lecture.video_filename, missing)
+            return PublishResult(action, video_id, str(entry.get("mana_lesson_id") or ""), missing)
 
-        mana = ManaLessons(client, settings.mana_api_url, session, sleep=sleep)
+        mana = ManaLessons(client, settings.mana_api_url, token, use_pipeline=use_pipeline, sleep=sleep)
         lesson_id = str(entry.get("mana_lesson_id") or "")
         current: dict | None = None
-        if lesson_id:
-            try:
+        try:
+            if use_pipeline:
+                current = mana.get_pipeline_lesson(lecture.drive_file_id)
+                if current:
+                    lesson_id = str(current.get("lesson_id") or lesson_id)
+            elif lesson_id:
                 current = mana.get_lesson(lesson_id)
-            except PublishError as exc:
-                _fail(db, lecture, state, entry, str(exc))
-            if current and lesson_is_published(current):
-                return _lock_published(db, lecture, state, entry, lesson_id)
-            if current is None:
-                lesson_id = ""
-            elif lesson_was_edited(current, entry.get("written_lesson")):
-                entry["status"] = "skipped_edited"
-                entry["error"] = ""
-                _persist(db, lecture, state, entry)
-                log.info("aula %s editada no site; não sobrescrevo", lesson_id)
-                return PublishResult(
-                    "skipped",
-                    str(entry.get("bunny_video_id") or ""),
-                    lesson_id,
-                    "aula editada no site; não alterada",
-                )
+            elif entry.get("status") == "lesson_pending":
+                current = mana.find_lesson_by_bunny_video_id(video_id)
+                if current:
+                    lesson_id = str(current.get("lesson_id") or "")
+                    log.info("adotei a aula %s pelo bunny_video_id %s", lesson_id, video_id)
+        except PublishError as exc:
+            _fail(db, lecture, state, entry, str(exc))
+        if current and lesson_is_published(current):
+            return _lock_published(db, lecture, state, entry, lesson_id or str(current.get("lesson_id") or ""))
+        if current is None:
+            lesson_id = ""
+        elif lesson_was_edited(current, entry.get("written_lesson")):
+            return _skip_edited(db, lecture, state, entry, lesson_id or str(current.get("lesson_id") or ""))
 
         if not str(draft.get("speaker_id") or "").strip():
             try:
@@ -1258,6 +1469,11 @@ def publish_lecture(
             wire["youtube_url"] = f"https://www.youtube.com/watch?v={youtube_id}"
         try:
             saved = mana.upsert_lesson(lecture.drive_file_id, wire, lesson_id=lesson_id)
+        except LessonConflict as exc:
+            saved_id = exc.lesson_id or lesson_id
+            if exc.reason == "published":
+                return _lock_published(db, lecture, state, entry, saved_id)
+            return _skip_edited(db, lecture, state, entry, saved_id)
         except PublishError as exc:
             _fail(db, lecture, state, entry, str(exc))
         saved_id = str(saved.get("lesson_id") or "")
@@ -1280,12 +1496,30 @@ def publish_lecture(
             client.close()
 
 
+def _skip_edited(db: Session, lecture: Lecture, state: dict, entry: dict, lesson_id: str) -> PublishResult:
+    entry["mana_lesson_id"] = lesson_id or entry.get("mana_lesson_id") or ""
+    entry["status"] = "skipped_edited"
+    entry["error"] = ""
+    if not entry.get("lesson_fingerprint") and entry.get("lesson_payload"):
+        entry["lesson_fingerprint"] = lesson_fingerprint(entry["lesson_payload"])
+    _persist(db, lecture, state, entry)
+    log.info("aula %s editada no site; não sobrescrevo", lesson_id)
+    return PublishResult(
+        "skipped",
+        str(entry.get("bunny_video_id") or ""),
+        str(entry.get("mana_lesson_id") or ""),
+        "aula editada no site; não alterada",
+    )
+
+
 def _is_complete(lecture: Lecture, entry: dict) -> bool:
     if not entry.get("bunny_video_id") or not entry.get("upload_complete"):
         return False
     if int(entry.get("encode_status") or 0) not in ENCODED_STATUSES:
         return False
     if entry.get("lesson_status") == "published" and entry.get("mana_lesson_id"):
+        return True
+    if entry.get("status") == "skipped_edited":
         return True
     if entry.get("refused_auto_publish"):
         return False

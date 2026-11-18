@@ -324,10 +324,17 @@ class SlideHymnalTest(unittest.TestCase):
         from backend.app.services.hymnal import is_slide_chrome
 
         self.assertTrue(is_slide_chrome("6 - “GLÓRIA AO SENHOR”"))
-        self.assertTrue(is_slide_chrome("6 - GLÓRIA AO SENHOR"))
-        self.assertTrue(is_slide_chrome("“GLÓRIA AO SENHOR”"))
-        self.assertTrue(is_slide_chrome('"Glória ao Senhor"'))
+        self.assertTrue(is_slide_chrome("1 “A Ti ó Deus”"))
         self.assertTrue(is_slide_chrome("1/4"))
+        # Sem aspas, só é título se bater com o hino.
+        self.assertFalse(is_slide_chrome("6 - GLÓRIA AO SENHOR"))
+        self.assertTrue(is_slide_chrome("6 - GLÓRIA AO SENHOR", "6", "Glória ao Senhor"))
+        # Aspas sozinhas: só na primeira linha do slide ou iguais ao título.
+        self.assertFalse(is_slide_chrome("“GLÓRIA AO SENHOR”"))
+        self.assertTrue(is_slide_chrome("“GLÓRIA AO SENHOR”", first_on_slide=True))
+        self.assertTrue(is_slide_chrome('"Glória ao Senhor"', "6", "Glória ao Senhor"))
+        self.assertFalse(is_slide_chrome("“Santo, santo, santo”"))
+        self.assertFalse(is_slide_chrome("3 - Cristo vive em mim"))
         self.assertFalse(is_slide_chrome("A NOSSO PAI DO CÉU,"))
         self.assertFalse(is_slide_chrome("tributa lábio meu glória e louvor"))
 

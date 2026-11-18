@@ -39,6 +39,7 @@ O cliente deste repositório manda só `draft`. Antes de um `PUT`, ele faz `GET`
 Uma aula rascunho que uma pessoa já editou (título, corpo, versículos, tipo, data, palestrante ou status diferentes do último envio) também não é sobrescrita. `cli publish --force` só ignora o limite de um vídeo do mesmo tipo no mesmo dia.
 
 O cliente envia `Idempotency-Key: {drive_file_id}` no `POST`/`PUT` de aula e persiste o rascunho em `state.json` antes do `POST`, para não criar outra aula se a execução cair no meio. A interface `ManaLessons.upsert_lesson(drive_file_id, …)` já está pronta para o futuro `PUT /api/pipeline/lessons/{drive_file_id}` (ligue `MANA_PIPELINE_LESSONS`). Até essa rota existir, o cliente continua em `/api/admin/lessons`.
+Com `MANA_PIPELINE_LESSONS=true`, o cliente autentica com `MANA_PIPELINE_TOKEN` (não exige `MANA_SESSION_TOKEN`), faz `GET /api/pipeline/lessons/{drive_file_id}` e manda só a allowlist (`title`, `date`, `type`, `speaker_id`, `verses`, `body`, `bunny_video_id`). Um `409 published` trava a aula; um `409 edited` marca `skipped_edited` e entra como resolvido até o fingerprint mudar.
 
 O `speaker_id` vem de `data/publish/speakers.json` ou de `MANA_SPEAKER_MAP` (JSON `{"Gerson": "speaker_abc"}`). O arquivo entra primeiro; a variável cobre o mesmo nome. Sem mapa, o cliente chama `GET /api/admin/speakers` e casa o nome sem acento e sem diferença de maiúsculas. Dois cadastros com o mesmo nome interrompem a aula, em vez de escolher um.
 
@@ -87,3 +88,10 @@ Nos dois casos o servidor precisa garantir:
 - Idempotência por um id estável (o `drive_file_id` da gravação). Hoje a API não tem esse campo; o cliente guarda `lesson_id` em `data/publish/state.json`. Se esse arquivo se perde, um `POST` novo cria outra aula.
 
 Até isso existir, o bible-notely não inventa um bearer fixo. Ou usa a sessão Google de `MANA_SESSION_TOKEN`, ou não chama a API.
+
+
+## Pendências conhecidas (revisão 2)
+
+- **TOCTOU no caminho admin.** Entre o `GET /api/admin/lessons` e o `POST`/`PUT`, outra execução ainda pode criar ou editar a aula. A correção definitiva é o `PUT /api/pipeline/lessons/{drive_file_id}` com credencial de máquina.
+- **Alinhamento sequencial dos versículos.** Faixas longas ainda podem se encostar ou ser recortadas quando vários versículos são lidos em sequência.
+- **Limiares dos hinos.** `MIN_LINE_HITS` e o filtro de refrão comum ainda podem falhar em casos de borda (catálogo pequeno ou letra muito repetida).

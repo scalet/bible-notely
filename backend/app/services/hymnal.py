@@ -37,28 +37,41 @@ _NUMBER_QUERY = re.compile(r"(?i)^(?:hino|n[oº°]?\.?|cc|cantor(?:\s+cristao)?)
 
 
 _SLIDE_TITLE = re.compile(
-    r"^(?:"
-    r"\d{1,4}\s*[-–—]\s*[“\"«]?\s*.+?\s*[”\"»]?\s*"  # 6 - título, com ou sem aspas
-    r"|[“\"«]\s*.{1,80}?[”\"»]\s*"  # “TÍTULO” sozinho no slide
-    r")$"
+    r"^\d{1,4}\s*(?:[-–—]\s*)?[“\"«].{1,80}[”\"»]\s*$"
 )
+_QUOTED_LINE = re.compile(r"^[“\"«].{1,80}[”\"»]\s*$")
 _PAGE_MARK = re.compile(r"^\d{1,2}\s*/\s*\d{1,2}$")
 _STROPH_MARK = re.compile(r"^(?:\d{1,2}\s*\.{1,2}|[•●])\s*")
 
 
-def is_slide_chrome(line: str, number: str = "", title: str = "") -> bool:
-    """Título e número que vêm dos slides .pps, não fazem parte da letra."""
+def _bare_title(line: str) -> str:
+    return fold((line or "").strip().strip("“”\"«»").strip())
+
+
+def is_slide_chrome(line: str, number: str = "", title: str = "", *, first_on_slide: bool = False) -> bool:
+    """Título e número que vêm dos slides .pps, não fazem parte da letra.
+
+    `N “Título”` (com ou sem travessão) é sempre chrome. Uma linha só entre aspas
+    só cai fora se for a primeira do slide ou igual ao título do hino. Versos
+    como “Santo, santo, santo” ou `3 - Cristo vive em mim` permanecem.
+    """
     stripped = (line or "").strip()
     if not stripped:
         return False
-    if _HEADER.match(stripped) or _SLIDE_TITLE.match(stripped) or _PAGE_MARK.match(stripped):
+    if _HEADER.match(stripped) or _PAGE_MARK.match(stripped) or _SLIDE_TITLE.match(stripped):
         return True
-    if number and fold(stripped) in {
-        fold(f"{number} {title}"),
-        fold(f"{number} - {title}"),
-        fold(f"{number} – {title}"),
-        fold(title),
-    }:
+    aliases = {fold(title)} if title else set()
+    if number and title:
+        aliases.update(
+            {
+                fold(f"{number} {title}"),
+                fold(f"{number} - {title}"),
+                fold(f"{number} – {title}"),
+            }
+        )
+    if aliases and (_bare_title(stripped) in aliases or fold(stripped) in aliases):
+        return True
+    if first_on_slide and _QUOTED_LINE.match(stripped):
         return True
     return False
 
@@ -199,9 +212,7 @@ def parse_hymn(filename: str, text: str) -> SongText | None:
     kept: list[str] = []
     for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         stripped = line.strip()
-        if _HEADER.match(stripped):
-            continue
-        if number and fold(stripped) in {fold(f"{number} {title}"), fold(f"{number} - {title}"), fold(title)}:
+        if _HEADER.match(stripped) or is_slide_chrome(stripped, number, title):
             continue
         kept.append(line)
     stanzas = split_stanzas("\n".join(kept))
@@ -245,21 +256,45 @@ def _visible_text(html: str) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def _slides_to_stanza_text(text: str) -> str:
-    """Cada repetição do título do slide abre um bloco: vira linha em branco entre estrofes."""
+def _page_lyric_lines(lines: list[str], number: str = "", title: str = "") -> list[str]:
     out: list[str] = []
-    for line in text.splitlines():
+    first = True
+    for line in lines:
         stripped = line.strip()
-        if _PAGE_MARK.match(stripped):
+        if not stripped or _PAGE_MARK.match(stripped):
             continue
-        if _SLIDE_TITLE.match(stripped) or is_slide_chrome(stripped):
+        if is_slide_chrome(stripped, number, title, first_on_slide=first):
+            first = False
             if out and out[-1] != "":
                 out.append("")
             continue
-        if _STROPH_MARK.match(line.strip()) and re.match(r"^\d", line.strip()) and out and out[-1] != "":
+        first = False
+        if _STROPH_MARK.match(stripped) and re.match(r"^\d", stripped) and out and out[-1] != "":
             out.append("")
-        out.append(line)
-    return "\n".join(out).strip() + "\n"
+        out.append(stripped)
+    return out
+
+
+def _pages_to_stanza_text(pages: list[list[str]], number: str = "", title: str = "") -> str:
+    """Monta estrofes a partir das linhas de cada slide, sem chrome de título."""
+    chunks = ["\n".join(_page_lyric_lines(lines, number, title)).strip() for lines in pages]
+    return "\n\n".join(chunk for chunk in chunks if chunk).strip() + "\n"
+
+
+def _slides_to_stanza_text(text: str, number: str = "", title: str = "") -> str:
+    """Cada repetição do título do slide abre um bloco: vira linha em branco entre estrofes."""
+    pages: list[list[str]] = []
+    current: list[str] = []
+    for line in text.replace("\r\n", "\n").splitlines():
+        if line.strip() == "---":
+            if current:
+                pages.append(current)
+                current = []
+            continue
+        current.append(line)
+    if current:
+        pages.append(current)
+    return _pages_to_stanza_text(pages, number, title)
 
 
 def _odp_text(element) -> str:
@@ -291,7 +326,7 @@ def _odp_text(element) -> str:
     return "".join(parts)
 
 
-def odp_to_stanza_text(path: Path) -> str:
+def odp_to_stanza_text(path: Path, number: str = "", title: str = "") -> str:
     """Lê text:p de cada draw:page em content.xml e monta as estrofes."""
     from xml.etree import ElementTree as ET
 
@@ -313,8 +348,8 @@ def odp_to_stanza_text(path: Path) -> str:
                 if stripped:
                     lines.append(stripped)
         if lines:
-            chunks.append("\n".join(lines))
-    return _slides_to_stanza_text("\n".join(chunks))
+            chunks.append(lines)
+    return _pages_to_stanza_text(chunks, number, title)
 
 
 def convert_slides(files: list[Path], dest: Path, batch: int = 25) -> list[Path]:
@@ -342,7 +377,13 @@ def convert_slides(files: list[Path], dest: Path, batch: int = 25) -> list[Path]
                 if not odp.is_file():
                     log.warning("slide sem conversão: %s", path.name)
                     continue
-                text = odp_to_stanza_text(odp)
+                stem = path.stem.strip()
+                number = title = ""
+                match = _FILENAME.match(stem)
+                if match and match.group(1):
+                    number = str(int(match.group(1)))
+                    title = (match.group(2) or "").strip(" -–.") or f"Hino {number}"
+                text = odp_to_stanza_text(odp, number=number, title=title)
                 target = dest / f"{path.stem}.txt"
                 target.write_text(text, encoding="utf-8")
                 written.append(target)
