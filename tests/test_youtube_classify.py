@@ -1,8 +1,10 @@
 import json
+import tempfile
 import unittest
+import sys
 from datetime import date, datetime, time
 from pathlib import Path
-import sys
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -15,6 +17,7 @@ from sqlalchemy.orm import sessionmaker
 from backend.app.db import Base
 from backend.app.models import Lecture
 from backend.app.models import Speaker
+from backend.app.services import youtube as ytsvc
 from backend.app.services.youtube import (
     apply_upload_entry,
     lecture_in_upload_scope,
@@ -67,6 +70,7 @@ class ClassifyTest(unittest.TestCase):
         self.assertIn("João 3:16", text)
         self.assertIn("Deus amou o mundo", text)
         self.assertIn("Amor de Deus", text)
+        # regressão: string tratada como lista saía uma letra por bullet
         self.assertNotIn("• A\n• m", text)
         self.assertIn("Conclusão\nAmor de Deus", text)
 
@@ -79,8 +83,6 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(row["skip_reason"], "sem título do estudo")
 
     def test_mounted_listing_and_scope(self) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             day = root / "2026" / "01-Janeiro" / "04-01"
@@ -121,17 +123,19 @@ class ClassifyTest(unittest.TestCase):
         self.assertIn("Tema da aula", row["youtube_title"])
 
     def test_missing_mounted_file(self) -> None:
-        row = yt.merge_video_row(
-            {
-                "id": "abc",
-                "name": "a.mp4",
-                "path": "2026/01-Janeiro/04-01",
-                "size": 2_000_000_000,
-                "local_path": "/tmp/does-not-exist-ebd.mp4",
-            },
-            {"abc": {"titulo": "Tema"}},
-            yt.empty_state(),
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "a.mp4"
+            row = yt.merge_video_row(
+                {
+                    "id": "abc",
+                    "name": "a.mp4",
+                    "path": "2026/01-Janeiro/04-01",
+                    "size": 2_000_000_000,
+                    "local_path": str(missing),
+                },
+                {"abc": {"titulo": "Tema"}},
+                yt.empty_state(),
+            )
         self.assertIn("não encontrado", row["skip_reason"])
 
     def test_quota_error(self) -> None:
@@ -262,3 +266,68 @@ class SyncSqliteTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MetaFolderAndCatalogTest(unittest.TestCase):
+    def setUp(self) -> None:
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        self.db = sessionmaker(bind=engine)()
+        self.addCleanup(self.db.close)
+
+    def test_meta_folder_id_from_settings_skips_drive(self) -> None:
+        with (
+            mock.patch.object(ytsvc.settings, "youtube_meta_folder_id", " pasta-fixa "),
+            mock.patch.object(ytsvc, "_drive", side_effect=AssertionError("não deveria usar o Drive")),
+        ):
+            self.assertEqual(ytsvc.ensure_meta_folder(), "pasta-fixa")
+
+    def test_meta_folder_without_root_raises(self) -> None:
+        fake = mock.Mock()
+        fake.get_folder_id.return_value = ""
+        with (
+            mock.patch.object(ytsvc.settings, "youtube_meta_folder_id", ""),
+            mock.patch.object(ytsvc, "_drive", return_value=fake),
+            self.assertRaises(ytsvc.YouTubeError),
+        ):
+            ytsvc.ensure_meta_folder()
+
+    def _export(self, existing_state: dict | None):
+        uploads: list[tuple[str, str, dict]] = []
+        with (
+            mock.patch.object(ytsvc, "ensure_meta_folder", return_value="pasta"),
+            mock.patch.object(ytsvc, "_download_json", return_value=existing_state),
+            mock.patch.object(
+                ytsvc, "_upload_json", side_effect=lambda f, n, p: uploads.append((f, n, p)) or "fid"
+            ),
+        ):
+            result = ytsvc.export_catalog(self.db)
+        return result, uploads
+
+    def test_export_creates_empty_state_when_missing(self) -> None:
+        (count, folder), uploads = self._export(None)
+        self.assertEqual((count, folder), (0, "pasta"))
+        self.assertEqual([u[1] for u in uploads], [ytsvc.CATALOG_NAME, ytsvc.STATE_NAME])
+        self.assertEqual(uploads[1][2], yt.empty_state())
+
+    def test_export_keeps_existing_state(self) -> None:
+        existing = yt.empty_state()
+        _, uploads = self._export(existing)
+        self.assertEqual([u[1] for u in uploads], [ytsvc.CATALOG_NAME])
+
+    def test_upload_json_uses_real_filename_and_cleans_up(self) -> None:
+        seen = {}
+        fake = mock.Mock()
+
+        def upload_file(path, folder_id, mime):
+            seen["name"] = path.name
+            seen["body"] = json.loads(path.read_text(encoding="utf-8"))
+            seen["path"] = path
+            return "fid"
+
+        fake.upload_file.side_effect = upload_file
+        with mock.patch.object(ytsvc, "_drive", return_value=fake):
+            self.assertEqual(ytsvc._upload_json("pasta", "state.json", {"a": "ção"}), "fid")
+        self.assertEqual(seen["name"], "state.json")
+        self.assertEqual(seen["body"], {"a": "ção"})
+        self.assertFalse(seen["path"].exists())
