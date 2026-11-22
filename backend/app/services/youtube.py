@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from backend.app.config import settings
 from backend.app.models import Lecture, Speaker
 from backend.app.runtime import get_youtube_upload_path
+from backend.app.services.compress import preferred_upload_source
 from colab.youtube_lib import (
     PLAYLIST_CULT_MANHA,
     PLAYLIST_CULT_NOITE,
@@ -417,13 +418,25 @@ def upload_lectures_local(db: Session, *, max_items: int = 1) -> tuple[int, int,
             skipped += 1
             continue
         local_path = settings.youtube_work_dir / lecture.video_filename
+        archive = preferred_upload_source(lecture)
+        remove_after = archive is None
         try:
-            drive.download_file(
-                lecture.drive_file_id,
-                local_path,
-                expected_size=lecture.video_size or 0,
-                expected_md5=lecture.video_md5 or "",
-            )
+            if archive is not None:
+                local_path = archive
+                log.info("YouTube usa o arquivo comprimido: %s", archive)
+            elif lecture.compressed and lecture.compressed_drive_file_id:
+                drive.download_file(
+                    lecture.compressed_drive_file_id,
+                    local_path,
+                    expected_size=lecture.compressed_size or 0,
+                )
+            else:
+                drive.download_file(
+                    lecture.drive_file_id,
+                    local_path,
+                    expected_size=lecture.video_size or 0,
+                    expected_md5=lecture.video_md5 or "",
+                )
             video_id = _upload_video_file(youtube, row, local_path)
             playlist_id = state["playlists"][row["playlist"]]
             _add_to_playlist(youtube, playlist_id, video_id)
@@ -458,7 +471,8 @@ def upload_lectures_local(db: Session, *, max_items: int = 1) -> tuple[int, int,
             if "quota" in detail or "403" in detail:
                 raise YouTubeError(f"Cota da API esgotada após {sent} envio(s): {exc}") from exc
         finally:
-            local_path.unlink(missing_ok=True)
+            if remove_after:
+                local_path.unlink(missing_ok=True)
 
     return sent, skipped, failed
 

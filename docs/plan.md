@@ -18,6 +18,7 @@ Desenho original. O código já saiu deste esboço. O estado vivo está em [prog
 - Cada resumo também vira uma nota Markdown para o Obsidian (`data/obsidian/` ou `OBSIDIAN_DIR`), com tags e links das passagens.
 - A interface de manutenção é lista + painel (Aulas, Palestrantes, Revisar, Ajustes). O Painel abre o item que precisa de atenção.
 - A varredura do Drive não roda em todo lote. Um checkpoint (`drive_index` em `data/runtime.json`) guarda o token da Changes API. Sem alteração na pasta configurada, a fila segue no SQLite. `POST /api/pipeline/sync` força a busca. Pastas fora de `ANO/NroMes-NomeMes/Dia-NroMes` não são abertas, então MP4 nelas não vira `skipped`.
+- Compressão local depois da transcrição (`backend/app/services/compress.py`). O Whisper continua no original. O arquivo `{stem}.compressed.mp4` é o que o YouTube envia. CRF 23, preset `veryfast`, H.264, áudio copiado, altura original. Um teto de altura (`COMPRESS_MAX_HEIGHT`) mantém a proporção. ffprobe confere a duração antes de gravar o SQLite. No fim da aula a cópia local da câmera sai; `COMPRESS_DELETE_ORIGINAL=false` guarda. O caminho comprimido fica relativo a `work/`. Envio do comprimido à pasta do dia é opt-in (`COMPRESS_UPLOAD_DRIVE`). Ajustes na tela **Vídeo** ou no `.env`. `cli compress` faz o backfill. O schema novo é aplicado ao abrir o banco.
 
 O texto abaixo é o rascunho de quando o repositório estava vazio. Foi mantido como histórico; onde ele discordar da lista acima, vale a lista.
 

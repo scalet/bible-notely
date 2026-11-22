@@ -601,6 +601,30 @@ def download_file(
     log.info("download concluído: %s (%s bytes)", dest.name, size)
 
 
+def search_by_name(name: str) -> list[dict]:
+    """Arquivos não excluídos com esse nome exato. Cada item traz id, name, parents e size."""
+    service = _service()
+    safe = name.replace("\\", "\\\\").replace("'", "\\'")
+    result = _execute(
+        f"busca de {name}",
+        service.files().list(
+            q=f"name = '{safe}' and trashed = false",
+            fields="files(id, name, parents, size, mimeType)",
+            pageSize=20,
+        ),
+    )
+    return list(result.get("files") or [])
+
+
+def file_name(file_id: str) -> str:
+    service = _service()
+    meta = _execute(
+        f"nome de {file_id}",
+        service.files().get(fileId=file_id, fields="name"),
+    )
+    return str(meta.get("name") or "")
+
+
 def download_named(folder_id: str, name: str, dest: Path) -> bool:
     service = _service()
     safe = name.replace("\\", "\\\\").replace("'", "\\'")

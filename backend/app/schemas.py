@@ -45,6 +45,10 @@ class LectureOut(BaseModel):
     summary_text: str
     warning: str = ""
     video_size: int = 0
+    original_size: int = 0
+    compressed: bool = False
+    compressed_size: int = 0
+    compressed_profile: str = ""
     transcribed: bool
     summarized: bool
     uploaded: bool
@@ -52,6 +56,10 @@ class LectureOut(BaseModel):
     youtube_url: str = ""
     youtube_title: str = ""
     youtube_uploaded_at: datetime | None = None
+    bunny_video_id: str = ""
+    mana_lesson_id: str = ""
+    publish_status: str = ""
+    publish_error: str = ""
     status: str
     error: str
     updated_at: datetime
@@ -78,6 +86,18 @@ class SettingsOut(BaseModel):
     youtube_scope_eligible: int = 0
     youtube_scope_pending: int = 0
     youtube_scope_uploaded: int = 0
+    compress_enabled: bool = True
+    compress_crf: int = 23
+    compress_preset: str = "veryfast"
+    compress_max_height: int = 0
+    compress_codec: str = "h264"
+    compress_audio: str = "copy"
+    compress_audio_bitrate: str = "128k"
+    compress_delete_original: bool = True
+    compress_upload_drive: bool = False
+    compress_duration_tolerance: float = 1.0
+    overlay_enabled: bool = True
+    overlay_wait_hours: float = 24.0
 
 
 class SettingsIn(BaseModel):
@@ -85,6 +105,41 @@ class SettingsIn(BaseModel):
     google_drive_folder_id: str | None = None
     youtube_upload_folder_id: str | None = None
     youtube_upload_path: str | None = None
+    compress_enabled: bool | None = None
+    compress_crf: int | None = None
+    compress_preset: str | None = None
+    compress_max_height: int | None = None
+    compress_codec: str | None = None
+    compress_audio: str | None = None
+    compress_audio_bitrate: str | None = None
+    compress_delete_original: bool | None = None
+    compress_upload_drive: bool | None = None
+    compress_duration_tolerance: float | None = None
+    overlay_enabled: bool | None = None
+    overlay_wait_hours: float | None = None
+
+
+class LyricPendingOut(BaseModel):
+    id: int
+    lecture_id: int
+    lecture_filename: str = ""
+    start_seconds: float
+    end_seconds: float
+    start_label: str
+    end_label: str
+    transcript_excerpt: str
+    status: str
+    title: str = ""
+    snippet_url: str | None = None
+    created_at: datetime
+    deadline_at: datetime | None = None
+
+
+class LyricResolveIn(BaseModel):
+    action: str
+    query: str = ""
+    lyrics: str = ""
+    title: str = ""
 
 
 class YouTubeFolderOut(BaseModel):

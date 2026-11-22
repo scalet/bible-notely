@@ -2,7 +2,13 @@ import { api } from "../api";
 import type { Lecture, Pipeline, Settings } from "../api";
 import { card, mono, muted } from "../ui";
 
-const STAGES = ["sync", "download", "identify", "transcribe", "summarize", "upload", "done"];
+const STAGES = ["sync", "download", "identify", "transcribe", "compress", "summarize", "upload", "done"];
+
+const PROGRESS_LABEL: Record<string, string> = {
+  download: "Baixando",
+  transcribe: "Transcrevendo",
+  compress: "Comprimindo",
+};
 
 export function Dashboard({
   settings,
@@ -68,12 +74,14 @@ export function Dashboard({
           Um vídeo por vez · Whisper {settings?.whisper_model} · IA {settings?.ai_provider} ({settings?.ai_model})
         </p>
         {pipeline?.current_filename ? <p className={mono}>{pipeline.current_filename}</p> : null}
-        {(pipeline?.stage === "download" || pipeline?.stage === "transcribe") && pipeline.progress != null ? (
+        {pipeline?.stage && PROGRESS_LABEL[pipeline.stage] && pipeline.progress != null ? (
           <div className="mt-3">
             <div className="h-1.5 w-full overflow-hidden rounded bg-raised">
               <div className="h-full bg-fg transition-all" style={{ width: `${pipeline.progress}%` }} />
             </div>
-            <p className={`${muted} mt-1`}>{pipeline.stage === "download" ? "Baixando" : "Transcrevendo"}… {pipeline.progress}%</p>
+            <p className={`${muted} mt-1`}>
+              {PROGRESS_LABEL[pipeline.stage]}… {pipeline.progress}%
+            </p>
           </div>
         ) : null}
         {pipeline?.prefetch_filename ? (

@@ -62,10 +62,20 @@ class ClassifyTest(unittest.TestCase):
             speaker_name="Gerson",
             summary=summary,
         )
-        self.assertIn("IBQB", text)
+        self.assertTrue(text.startswith("IBQB"))
+        self.assertNotIn("Igreja Batista", text)
+        self.assertNotIn("Quadrangular", text)
         self.assertIn("Gerson", text)
         self.assertIn("João 3:16", text)
         self.assertIn("Deus amou o mundo", text)
+
+    def test_theme_is_cleaned_in_youtube_title(self) -> None:
+        title = yt.build_youtube_title(
+            "Perfeitos em Unidade — EBD e Culto do Dia dos Pais",
+            date(2026, 8, 9),
+            yt.PLAYLIST_CULT_MANHA,
+        )
+        self.assertEqual(title, "IBQB - Culto - 09/08/2026 - Perfeitos em Unidade")
 
     def test_skip_without_study_title(self) -> None:
         row = yt.merge_video_row(
