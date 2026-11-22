@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import logging
 import re
@@ -10,10 +11,12 @@ import unicodedata
 from collections.abc import Callable
 from datetime import date
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 
+import httplib2
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google_auth_httplib2 import AuthorizedHttp
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -50,7 +53,13 @@ _account_cache: dict[str, str | float] = {"mtime": 0.0, "label": "", "fail_until
 _creds_cache: dict[str, object] = {"mtime": 0.0, "creds": None, "fail_until": 0.0}
 _service_cache: dict[str, object] = {"mtime": 0.0, "service": None}
 _listed_folders: set[str] = set()
+_api_lock = Lock()
+_account_lock = Lock()
 FAIL_TTL_SECONDS = 300
+_MEDIA_TIMEOUT = 300
+_METADATA_TIMEOUT = 60
+_CHUNK_BYTES = 8 * 1024 * 1024
+_CHUNK_TRIES = 6
 
 
 class DriveError(RuntimeError):
@@ -90,7 +99,8 @@ def _http_error(exc: HttpError) -> str:
 
 def _execute(label: str, request):
     try:
-        return request.execute(num_retries=3)
+        with _api_lock:
+            return request.execute(num_retries=3)
     except HttpError as exc:
         detail = _http_error(exc)
         log.error("Google recusou %s: %s", label, detail)
@@ -152,26 +162,36 @@ def _read_account(service) -> str:
     return f"{name} <{email}>".strip()
 
 
-def google_account() -> str:
-    """E-mail da conta OAuth, em cache. Não chama o Google a cada poll da tela."""
-    path = settings.google_token_path
-    if not path.exists() or credentials() is None:
-        _account_cache.update(mtime=0.0, label="", fail_until=0.0)
-        return ""
-    mtime = path.stat().st_mtime
+def _cached_account(mtime: float) -> str | None:
     if _account_cache["mtime"] == mtime and _account_cache["label"]:
         return str(_account_cache["label"])
     if _account_cache["mtime"] == mtime and time.monotonic() < float(_account_cache["fail_until"]):
         return ""
-    try:
-        label = _read_account(_service(log_missing=False))
-    except Exception as exc:
-        log.warning("não identifiquei a conta Google: %s", exc)
-        _account_cache.update(mtime=mtime, label="", fail_until=time.monotonic() + FAIL_TTL_SECONDS)
+    return None
+
+
+def google_account() -> str:
+    """E-mail da conta OAuth, em cache. Não chama o Google a cada poll da tela."""
+    path = settings.google_token_path
+    if not path.exists() or credentials() is None:
+        with _account_lock:
+            _account_cache.update(mtime=0.0, label="", fail_until=0.0)
         return ""
-    _account_cache.update(mtime=mtime, label=label, fail_until=0.0)
-    log.info("conta Google em uso: %s (OAuth do usuário, não conta de serviço)", label)
-    return label
+    mtime = path.stat().st_mtime
+    with _account_lock:
+        cached = _cached_account(mtime)
+        if cached is not None:
+            return cached
+        try:
+            label = _read_account(_service(log_missing=False))
+        except Exception as exc:
+            log.warning("não identifiquei a conta Google: %s", exc)
+            if not _account_cache["label"]:
+                _account_cache.update(mtime=mtime, label="", fail_until=time.monotonic() + FAIL_TTL_SECONDS)
+            return str(_account_cache["label"])
+        _account_cache.update(mtime=mtime, label=label, fail_until=0.0)
+        log.info("conta Google em uso: %s (OAuth do usuário, não conta de serviço)", label)
+        return label
 
 
 def _pkce_path() -> Path:
@@ -294,18 +314,24 @@ def exchange_code(code: str) -> None:
     google_account()
 
 
-def _service(*, log_missing: bool = True):
+def _authorized_http(creds: Credentials, timeout: int) -> AuthorizedHttp:
+    return AuthorizedHttp(creds, http=httplib2.Http(timeout=timeout))
+
+
+def _service(*, log_missing: bool = True, isolated: bool = False):
     creds = credentials()
     if not creds:
         if log_missing:
             log.warning("operação no Drive cancelada: conta não conectada")
         raise DriveError("Google Drive não conectado")
+    if isolated:
+        return build("drive", "v3", http=_authorized_http(creds, _MEDIA_TIMEOUT), cache_discovery=True)
     path = settings.google_token_path
     mtime = path.stat().st_mtime if path.exists() else 0.0
     cached = _service_cache.get("service")
     if cached is not None and _service_cache.get("mtime") == mtime:
         return cached
-    service = build("drive", "v3", credentials=creds, cache_discovery=True)
+    service = build("drive", "v3", http=_authorized_http(creds, _METADATA_TIMEOUT), cache_discovery=True)
     _service_cache.update(mtime=mtime, service=service)
     return service
 
@@ -538,6 +564,44 @@ def file_md5(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _transient_download_error(name: str, exc: BaseException) -> DriveTransient | None:
+    """Conexão caída no meio do chunk vira retomada. Erro definitivo do Google não."""
+    if isinstance(exc, HttpError):
+        status_code = int(getattr(exc.resp, "status", 0) or 0)
+        if status_code in {408, 429} or status_code >= 500:
+            return DriveTransient(f"Google recusou download de {name}: {_http_error(exc)}")
+        return None
+    if isinstance(exc, AttributeError) and "read" in str(exc):
+        return DriveTransient(f"Conexão caiu ao baixar {name}")
+    if isinstance(exc, (TimeoutError, ConnectionError, http.client.HTTPException)):
+        return DriveTransient(f"Falha de rede ao baixar {name}: {exc}")
+    if isinstance(exc, OSError) and not isinstance(exc, (FileNotFoundError, PermissionError)):
+        return DriveTransient(f"Falha de rede ao baixar {name}: {exc}")
+    return None
+
+
+def _discard_downloader(downloader) -> int:
+    progress = int(getattr(downloader, "_progress", 0) or 0)
+    request = getattr(downloader, "_request", None)
+    http = getattr(request, "http", None)
+    close = getattr(http, "close", None)
+    if close:
+        try:
+            close()
+        except Exception:
+            pass
+    return progress
+
+
+def _open_downloader(file_id: str, fh, progress: int):
+    service = _service(isolated=True)
+    request = service.files().get_media(fileId=file_id)
+    downloader = MediaIoBaseDownload(fh, request, chunksize=_CHUNK_BYTES)
+    if progress:
+        downloader._progress = progress
+    return downloader
+
+
 def download_file(
     file_id: str,
     dest: Path,
@@ -546,8 +610,6 @@ def download_file(
     cancel: Event | None = None,
     expected_md5: str = "",
 ) -> None:
-    service = _service()
-    request = service.files().get_media(fileId=file_id)
     dest.parent.mkdir(parents=True, exist_ok=True)
     log.info(
         "baixando %s (id=%s, esperado=%s bytes) como %s",
@@ -557,9 +619,11 @@ def download_file(
         google_account() or "conta não identificada",
     )
     last_step = -1
+    offset = 0
     with dest.open("wb") as fh:
-        downloader = MediaIoBaseDownload(fh, request, chunksize=8 * 1024 * 1024)
+        downloader = _open_downloader(file_id, fh, offset)
         done = False
+        tries = 0
         while not done:
             if cancel is not None and cancel.is_set():
                 fh.close()
@@ -567,25 +631,45 @@ def download_file(
                 log.warning("download de %s cancelado", dest.name)
                 raise DriveCancelled("Download cancelado")
             try:
-                status, done = downloader.next_chunk(num_retries=5)
-            except HttpError as exc:
-                detail = _http_error(exc)
-                log.error("download de %s interrompido: %s", dest.name, detail)
-                status_code = getattr(exc.resp, "status", 0)
-                error_cls = DriveTransient if status_code in {408, 429} or status_code >= 500 else DriveError
-                raise error_cls(f"Google recusou download de {dest.name}: {detail}") from exc
-            except (OSError, TimeoutError) as exc:
-                if isinstance(exc, DriveError) or isinstance(exc, FileNotFoundError | PermissionError):
+                status, done = downloader.next_chunk(num_retries=2)
+            except Exception as exc:
+                cause = exc
+                dropped = _transient_download_error(dest.name, cause)
+                if dropped is None:
+                    if isinstance(cause, HttpError):
+                        detail = _http_error(cause)
+                        log.error("download de %s interrompido: %s", dest.name, detail)
+                        raise DriveError(f"Google recusou download de {dest.name}: {detail}") from cause
                     raise
-                log.error("download de %s interrompido por falha de rede: %s", dest.name, exc)
-                raise DriveTransient(f"Falha de rede ao baixar {dest.name}: {exc}") from exc
-            if status:
-                if progress:
-                    progress(status.progress())
-                step = int(status.progress() * 10)
-                if step != last_step:
-                    last_step = step
-                    log.info("download %s: %s%%", dest.name, step * 10)
+            else:
+                tries = 0
+                offset = int(getattr(downloader, "_progress", offset) or offset)
+                if status:
+                    if progress:
+                        progress(status.progress())
+                    step = int(status.progress() * 10)
+                    if step != last_step:
+                        last_step = step
+                        log.info("download %s: %s%%", dest.name, step * 10)
+                continue
+            tries += 1
+            offset = _discard_downloader(downloader)
+            if tries >= _CHUNK_TRIES:
+                log.error("download de %s interrompido: %s", dest.name, dropped)
+                raise dropped from cause
+            delay = min(2 ** (tries - 1), 20)
+            log.warning(
+                "download de %s interrompido (%s); retomando do byte %s, tentativa %s/%s em %ss",
+                dest.name,
+                dropped,
+                offset,
+                tries + 1,
+                _CHUNK_TRIES,
+                delay,
+            )
+            time.sleep(delay)
+            downloader = _open_downloader(file_id, fh, offset)
+        _discard_downloader(downloader)
     size = dest.stat().st_size
     if expected_size and size < expected_size * 0.98:
         dest.unlink(missing_ok=True)

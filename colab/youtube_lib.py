@@ -168,15 +168,36 @@ def render_description(
     for label, key in (
         ("Pontos", "pontos"),
         ("Aplicações", "aplicacoes"),
-        ("Conclusão", "conclusao"),
     ):
-        items = [str(x).strip() for x in (summary.get(key) or []) if str(x).strip()]
+        items = _as_text_items(summary.get(key))
         if items:
             parts.append(label)
             parts.extend(f"• {item}" for item in items)
             parts.append("")
+    for label, key in (
+        ("Conclusão", "conclusao"),
+        ("Encerramento da EBD", "encerramento"),
+    ):
+        block = _as_paragraph(summary.get(key))
+        if block:
+            parts += [label, block, ""]
     text = "\n".join(parts).strip()
     return text[:DESCRIPTION_MAX]
+
+
+def _as_text_items(value) -> list[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _as_paragraph(value) -> str:
+    if isinstance(value, list):
+        return " ".join(str(item).strip() for item in value if str(item).strip())
+    return str(value or "").strip()
 
 
 def youtube_watch_url(video_id: str) -> str:
@@ -228,9 +249,80 @@ def already_uploaded(state: dict[str, Any], drive_file_id: str) -> bool:
     return bool(entry.get("youtube_id"))
 
 
+def in_scope_path(drive_path: str, prefix: str) -> bool:
+    if not prefix:
+        return True
+    path = drive_path.replace("\\", "/").strip("/")
+    prefix = prefix.replace("\\", "/").strip("/")
+    return path == prefix or path.startswith(f"{prefix}/")
+
+
 def catalog_index(catalog: dict[str, Any]) -> dict[str, dict[str, Any]]:
     items = catalog.get("items") or catalog.get("aulas") or []
-    return {str(item["drive_file_id"]): item for item in items if item.get("drive_file_id")}
+    index: dict[str, dict[str, Any]] = {}
+    for item in items:
+        file_id = str(item.get("drive_file_id") or "")
+        if file_id:
+            index[file_id] = item
+        path = str(item.get("drive_path") or "").replace("\\", "/").strip("/")
+        name = str(item.get("video_filename") or item.get("name") or "")
+        if path and name:
+            index[f"{path}/{name}"] = item
+    return index
+
+
+def catalog_file_key(drive_path: str, filename: str) -> str:
+    return f"{drive_path.replace('\\', '/').strip('/')}/{filename}"
+
+
+def list_mounted_mp4s(ebd_root: Path, scope_prefix: str = "") -> list[dict[str, Any]]:
+    """Lista MP4s no Drive montado (`/content/drive/MyDrive/...`)."""
+    root = Path(ebd_root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Pasta do Drive não encontrada: {root}")
+    videos: list[dict[str, Any]] = []
+    for path in sorted(root.rglob("*.mp4")):
+        rel = path.relative_to(root)
+        folder = str(rel.parent).replace("\\", "/")
+        if folder == ".":
+            folder = ""
+        if not in_scope_path(folder, scope_prefix):
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        event_date = parse_path_date(folder)
+        videos.append(
+            {
+                "id": "",
+                "name": path.name,
+                "folder_id": "",
+                "path": folder,
+                "size": size,
+                "local_path": str(path),
+                "lecture_date": event_date.isoformat() if event_date else "",
+            }
+        )
+    return videos
+
+
+def resolve_local_video(ebd_root: Path, drive_path: str, filename: str) -> Path:
+    return Path(ebd_root) / drive_path.replace("\\", "/").strip("/") / filename
+
+
+def is_youtube_quota_error(exc: BaseException) -> bool:
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    raw = getattr(exc, "content", b"") or b""
+    text = raw.decode("utf-8", errors="ignore") if isinstance(raw, bytes) else str(raw)
+    combined = f"{exc} {text}".lower()
+    quota_mark = any(
+        token in combined
+        for token in ("quotaexceeded", "dailyLimitExceeded".lower(), "quota exceeded", "rateLimitExceeded".lower())
+    )
+    if status in {403, 429} and quota_mark:
+        return True
+    return "quota" in combined and ("exceed" in combined or "limit" in combined)
 
 
 def merge_video_row(
@@ -239,8 +331,12 @@ def merge_video_row(
     state: dict[str, Any],
 ) -> dict[str, Any]:
     """Monta linha de preview/upload a partir do MP4 listado no Drive."""
+    path = str(video.get("path") or "").replace("\\", "/").strip("/")
+    filename = str(video.get("name") or video.get("video_filename") or "")
     file_id = str(video.get("id") or video.get("drive_file_id") or "")
-    cat = catalog_by_id.get(file_id, {})
+    cat = catalog_by_id.get(file_id) or catalog_by_id.get(catalog_file_key(path, filename), {})
+    if not file_id:
+        file_id = str(cat.get("drive_file_id") or catalog_file_key(path, filename))
     summary = cat.get("summary") or cat.get("resumo")
     if isinstance(summary, str):
         try:
@@ -250,7 +346,7 @@ def merge_video_row(
     study = study_title_from_summary(summary if isinstance(summary, dict) else None)
     if not study and cat.get("titulo"):
         study = str(cat["titulo"]).strip()
-    event_date = video.get("lecture_date")
+    event_date = video.get("lecture_date") or cat.get("lecture_date")
     if isinstance(event_date, str):
         try:
             event_date = date.fromisoformat(event_date)
@@ -267,8 +363,9 @@ def merge_video_row(
     return {
         "drive_file_id": file_id,
         "drive_folder_id": str(video.get("folder_id") or cat.get("drive_folder_id") or ""),
-        "drive_path": str(video.get("path") or cat.get("drive_path") or ""),
-        "video_filename": str(video.get("name") or cat.get("video_filename") or ""),
+        "drive_path": str(video.get("path") or cat.get("drive_path") or path),
+        "video_filename": filename or str(cat.get("video_filename") or ""),
+        "local_path": str(video.get("local_path") or ""),
         "size": int(video.get("size") or 0),
         "study_title": study,
         "youtube_title": youtube_title,
@@ -283,14 +380,22 @@ def merge_video_row(
             speaker_name=str(cat.get("speaker_name") or ""),
             summary=summary if isinstance(summary, dict) else None,
         ),
-        "skip_reason": _skip_reason(video, study, state, file_id),
+        "skip_reason": _skip_reason(video, study, state, file_id, local_path=str(video.get("local_path") or "")),
         "already_on_youtube": already_uploaded(state, file_id),
     }
 
 
-def _skip_reason(video: dict[str, Any], study: str, state: dict[str, Any], file_id: str) -> str:
+def _skip_reason(
+    video: dict[str, Any],
+    study: str,
+    state: dict[str, Any],
+    file_id: str,
+    local_path: str = "",
+) -> str:
     if already_uploaded(state, file_id):
         return "já enviado"
+    if local_path and not Path(local_path).is_file():
+        return f"arquivo não encontrado no Drive montado: {local_path}"
     size = int(video.get("size") or 0)
     if size and size < MIN_VIDEO_BYTES:
         return "arquivo pequeno (<50 MiB)"
@@ -312,3 +417,122 @@ def build_catalog_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
 
 def read_catalog_path(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def read_json(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+PLAYLIST_TITLES = {
+    PLAYLIST_EBD: "IBQB — EBD",
+    PLAYLIST_CULT_MANHA: "IBQB — Culto da manhã",
+    PLAYLIST_CULT_NOITE: "IBQB — Culto da noite",
+}
+
+
+def load_colab_credentials(secret_path: Path, token_path: Path, scopes: list[str]):
+    """OAuth para o Colab: reusa token no Drive; senão abre URL e pede o código."""
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+
+    creds = None
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(str(token_path), scopes)
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            token_path.write_text(creds.to_json(), encoding="utf-8")
+            return creds
+        if creds and creds.valid:
+            return creds
+    if not secret_path.exists():
+        raise FileNotFoundError(
+            f"client_secret.json não encontrado em {secret_path}. "
+            "Coloque o JSON OAuth Desktop nessa pasta do Drive."
+        )
+    flow = InstalledAppFlow.from_client_secrets_file(str(secret_path), scopes)
+    flow.redirect_uri = "http://localhost:8080/"
+    auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent")
+    print("1. Abra este link no navegador e autorize a conta do canal YouTube:")
+    print(auth_url)
+    print("2. O Google tenta abrir localhost:8080. Copie o valor de ?code= da barra de endereço")
+    print("   (ou a URL inteira) e cole abaixo.")
+    raw = input("Código ou URL: ").strip()
+    if "code=" in raw:
+        from urllib.parse import parse_qs, urlparse
+
+        parsed = urlparse(raw)
+        raw = (parse_qs(parsed.query).get("code") or [""])[0]
+    flow.fetch_token(code=raw)
+    creds = flow.credentials
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(creds.to_json(), encoding="utf-8")
+    print(f"Token salvo em {token_path} (persiste no Drive).")
+    return creds
+
+
+def upload_video_file(youtube, local_path: Path, row: dict[str, Any], progress=None) -> str:
+    from googleapiclient.http import MediaFileUpload
+
+    if not Path(local_path).is_file():
+        raise FileNotFoundError(f"Vídeo não encontrado no Drive montado: {local_path}")
+    body = {
+        "snippet": {
+            "title": row["youtube_title"],
+            "description": row.get("description") or "",
+            "categoryId": "29",
+        },
+        "status": {
+            "privacyStatus": "unlisted",
+            "selfDeclaredMadeForKids": False,
+        },
+    }
+    media = MediaFileUpload(str(local_path), mimetype="video/mp4", chunksize=8 * 1024 * 1024, resumable=True)
+    request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+    response = None
+    last = -1
+    while response is None:
+        status, response = request.next_chunk()
+        if status:
+            pct = int(status.progress() * 100)
+            if pct != last:
+                last = pct
+                print(f"  upload {pct}%", flush=True)
+                if progress:
+                    progress(pct)
+    return str(response["id"])
+
+
+def add_to_playlist(youtube, playlist_id: str, video_id: str) -> None:
+    youtube.playlistItems().insert(
+        part="snippet",
+        body={
+            "snippet": {
+                "playlistId": playlist_id,
+                "resourceId": {"kind": "youtube#video", "videoId": video_id},
+            }
+        },
+    ).execute()
+
+
+def ensure_playlists(youtube, state: dict[str, Any]) -> dict[str, Any]:
+    state.setdefault("playlists", {})
+    for key, title in PLAYLIST_TITLES.items():
+        if state["playlists"].get(key):
+            continue
+        created = youtube.playlists().insert(
+            part="snippet,status",
+            body={
+                "snippet": {"title": title, "description": "Arquivo IBQB (não listado)"},
+                "status": {"privacyStatus": "unlisted"},
+            },
+        ).execute()
+        state["playlists"][key] = created["id"]
+    return state

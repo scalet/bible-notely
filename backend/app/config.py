@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     obsidian_dir: Path = ROOT / "data" / "obsidian"
 
     google_drive_folder_id: str = ""
+    youtube_meta_folder_id: str = ""
     google_client_id: str = ""
     google_client_secret: str = ""
     google_redirect_uri: str = "http://127.0.0.1:8000/api/drive/callback"

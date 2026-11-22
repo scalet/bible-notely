@@ -3,10 +3,12 @@ import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from threading import Event
 from unittest import mock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from googleapiclient.errors import HttpError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -416,6 +418,270 @@ class DownloadMd5Test(unittest.TestCase):
             self._run(dest, b"errado", "0" * 32)
         self.assertFalse(dest.exists())
         dest.parent.rmdir()
+
+    def test_resumes_after_dropped_connection(self) -> None:
+        payload = b"aula-ebd"
+        dest = Path(tempfile.mkdtemp()) / "aula.mp4"
+        calls = {"n": 0}
+
+        class _Downloader:
+            def __init__(self, fh, *_args, **_kwargs) -> None:
+                self.fh = fh
+                self._progress = 0
+
+            def next_chunk(self, num_retries=0):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise AttributeError("'NoneType' object has no attribute 'read'")
+                self.fh.write(payload)
+                self._progress = len(payload)
+                return None, True
+
+        with (
+            mock.patch.object(drive, "_service", return_value=self._Service()),
+            mock.patch.object(drive, "google_account", return_value="conta"),
+            mock.patch.object(drive, "MediaIoBaseDownload", _Downloader),
+            mock.patch.object(drive.time, "sleep"),
+        ):
+            drive.download_file(
+                "id",
+                dest,
+                expected_size=len(payload),
+                expected_md5=hashlib.md5(payload).hexdigest(),
+            )
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(dest.read_bytes(), payload)
+        dest.unlink()
+        dest.parent.rmdir()
+
+    def test_gives_up_when_connection_keeps_dropping(self) -> None:
+        dest = Path(tempfile.mkdtemp()) / "aula.mp4"
+
+        class _Downloader:
+            def __init__(self, fh, *_args, **_kwargs) -> None:
+                self.fh = fh
+
+            def next_chunk(self, num_retries=0):
+                raise AttributeError("'NoneType' object has no attribute 'read'")
+
+        with (
+            mock.patch.object(drive, "_service", return_value=self._Service()),
+            mock.patch.object(drive, "google_account", return_value="conta"),
+            mock.patch.object(drive, "MediaIoBaseDownload", _Downloader),
+            mock.patch.object(drive.time, "sleep"),
+            self.assertRaises(drive.DriveTransient),
+        ):
+            drive.download_file("id", dest, expected_size=8)
+        dest.unlink(missing_ok=True)
+        dest.parent.rmdir()
+
+
+class _FakeResp:
+    def __init__(self, status: int) -> None:
+        self.status = status
+        self.reason = "x"
+
+
+def _http_error(status: int) -> HttpError:
+    return HttpError(_FakeResp(status), b'{"error":{"message":"falhou"}}')
+
+
+class DownloadResumeTest(unittest.TestCase):
+    """Retomada por chunk: offset, limite de tentativas, backoff e erros definitivos."""
+
+    class _Service:
+        def files(self):
+            return self
+
+        def get_media(self, fileId: str):
+            return object()
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dest = Path(tmp.name) / "aula.mp4"
+        self.sleep = mock.Mock()
+        self.opened: list[int] = []
+
+    def _download(self, script: list, *, cancel=None, **kwargs) -> None:
+        """`script` é uma lista de ações por next_chunk: bytes (sucesso, escreve) ou exceção."""
+        opened = self.opened
+        steps = iter(script)
+
+        class _Downloader:
+            def __init__(self, fh, *_args, **_kwargs) -> None:
+                self.fh = fh
+                self._progress = 0
+                opened.append(-1)
+
+            def next_chunk(self, num_retries=0):
+                step = next(steps)
+                if isinstance(step, BaseException):
+                    raise step
+                self.fh.write(step)
+                self._progress += len(step)
+                return None, self._progress >= kwargs.get("expected_size", 10**9)
+
+        real_open = drive._open_downloader
+
+        def _open(file_id, fh, progress):
+            downloader = real_open(file_id, fh, progress)
+            opened[-1] = progress
+            return downloader
+
+        with (
+            mock.patch.object(drive, "_service", return_value=self._Service()),
+            mock.patch.object(drive, "google_account", return_value="conta"),
+            mock.patch.object(drive, "MediaIoBaseDownload", _Downloader),
+            mock.patch.object(drive, "_open_downloader", _open),
+            mock.patch.object(drive.time, "sleep", self.sleep),
+        ):
+            drive.download_file("id", self.dest, cancel=cancel, **kwargs)
+
+    def test_reopens_downloader_at_bytes_already_written(self) -> None:
+        part1, part2 = b"aaaa", b"bbbb"
+        self._download(
+            [part1, ConnectionResetError("reset"), part2],
+            expected_size=8,
+            expected_md5=hashlib.md5(part1 + part2).hexdigest(),
+        )
+        self.assertEqual(self.opened, [0, 4])
+        self.assertEqual(self.dest.read_bytes(), part1 + part2)
+
+    def test_gives_up_after_chunk_tries_with_exponential_backoff(self) -> None:
+        calls = {"n": 0}
+
+        def boom():
+            calls["n"] += 1
+            return AttributeError("'NoneType' object has no attribute 'read'")
+
+        script = [boom() for _ in range(drive._CHUNK_TRIES)]
+        with self.assertRaises(drive.DriveTransient):
+            self._download(script, expected_size=8)
+        self.assertEqual(calls["n"], drive._CHUNK_TRIES)
+        self.assertEqual(
+            [c.args[0] for c in self.sleep.call_args_list],
+            [1, 2, 4, 8, 16][: drive._CHUNK_TRIES - 1],
+        )
+
+    def test_success_resets_attempt_counter(self) -> None:
+        chunk = b"x"
+        # (limite-1) falhas, 1 sucesso, (limite-1) falhas, sucesso final: só passa se o contador zerar
+        n = drive._CHUNK_TRIES - 1
+        script = [TimeoutError("lento") for _ in range(n)] + [chunk]
+        script += [TimeoutError("lento") for _ in range(n)] + [chunk]
+        self._download(script, expected_size=2)
+        self.assertEqual(self.dest.read_bytes(), chunk * 2)
+        # o backoff recomeça em 1 depois do sucesso
+        delays = [c.args[0] for c in self.sleep.call_args_list]
+        self.assertEqual(delays[n], 1)
+
+    def test_transient_http_errors_are_resumed(self) -> None:
+        for status in (408, 429, 500, 503):
+            with self.subTest(status=status):
+                self.sleep.reset_mock()
+                self._download([_http_error(status), b"ok"], expected_size=2)
+                self.assertEqual(self.sleep.call_count, 1)
+
+    def test_definitive_http_errors_fail_without_retry(self) -> None:
+        for status in (403, 404):
+            with self.subTest(status=status):
+                self.sleep.reset_mock()
+                with self.assertRaises(drive.DriveError) as ctx:
+                    self._download([_http_error(status), b"nunca"], expected_size=5)
+                self.assertNotIsInstance(ctx.exception, drive.DriveTransient)
+                self.sleep.assert_not_called()
+
+    def test_permission_error_is_not_retried(self) -> None:
+        with self.assertRaises(PermissionError):
+            self._download([PermissionError("negado"), b"nunca"], expected_size=5)
+        self.sleep.assert_not_called()
+
+    def test_cancel_stops_before_next_chunk(self) -> None:
+        cancel = Event()
+        cancel.set()
+        with self.assertRaises(drive.DriveCancelled):
+            self._download([b"nunca"], cancel=cancel, expected_size=5)
+        self.assertFalse(self.dest.exists())
+
+
+class GoogleAccountCacheTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.token = Path(tmp.name) / "token.json"
+        self.token.write_text("{}")
+        saved = dict(drive._account_cache)
+        self.addCleanup(lambda: drive._account_cache.update(saved))
+        drive._account_cache.update(mtime=0.0, label="", fail_until=0.0)
+        patch = mock.patch.object(
+            type(drive.settings), "google_token_path", new_callable=mock.PropertyMock, return_value=self.token
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def _account(self, read_account: mock.Mock, *, creds: object | None = object()) -> str:
+        with (
+            mock.patch.object(drive, "credentials", return_value=creds),
+            mock.patch.object(drive, "_service", return_value=object()),
+            mock.patch.object(drive, "_read_account", read_account),
+        ):
+            return drive.google_account()
+
+    def test_label_is_cached_per_token_mtime(self) -> None:
+        read = mock.Mock(return_value="Ana <ana@x.com>")
+        self.assertEqual(self._account(read), "Ana <ana@x.com>")
+        self.assertEqual(self._account(read), "Ana <ana@x.com>")
+        self.assertEqual(read.call_count, 1)
+
+    def test_failure_is_remembered_for_ttl(self) -> None:
+        read = mock.Mock(side_effect=RuntimeError("rede"))
+        self.assertEqual(self._account(read), "")
+        self.assertEqual(self._account(read), "")
+        self.assertEqual(read.call_count, 1)
+
+    def test_failure_keeps_previous_label_after_token_refresh(self) -> None:
+        drive._account_cache.update(mtime=1.0, label="Ana <ana@x.com>", fail_until=0.0)
+        read = mock.Mock(side_effect=RuntimeError("rede"))
+        self.assertEqual(self._account(read), "Ana <ana@x.com>")
+
+    def test_without_credentials_clears_cache(self) -> None:
+        drive._account_cache.update(mtime=1.0, label="Ana", fail_until=0.0)
+        self.assertEqual(self._account(mock.Mock(), creds=None), "")
+        self.assertEqual(drive._account_cache["label"], "")
+
+
+class ServiceTimeoutTest(unittest.TestCase):
+    def setUp(self) -> None:
+        saved = dict(drive._service_cache)
+        self.addCleanup(lambda: drive._service_cache.update(saved))
+        drive._service_cache.update(mtime=0.0, service=None)
+        self.creds = object()
+
+    def _timeout_of(self, **kwargs) -> int:
+        with (
+            mock.patch.object(drive, "credentials", return_value=self.creds),
+            mock.patch.object(drive, "build") as build,
+            mock.patch.object(drive, "AuthorizedHttp") as authorized,
+        ):
+            drive._service(**kwargs)
+        self.assertEqual(authorized.call_args.args[0], self.creds)
+        return authorized.call_args.kwargs["http"].timeout
+
+    def test_metadata_and_media_use_different_timeouts(self) -> None:
+        self.assertEqual(self._timeout_of(), drive._METADATA_TIMEOUT)
+        self.assertEqual(self._timeout_of(isolated=True), drive._MEDIA_TIMEOUT)
+
+    def test_isolated_service_is_not_cached(self) -> None:
+        with (
+            mock.patch.object(drive, "credentials", return_value=self.creds),
+            mock.patch.object(drive, "build", side_effect=lambda *a, **k: object()),
+            mock.patch.object(drive, "AuthorizedHttp"),
+        ):
+            first = drive._service(isolated=True)
+            second = drive._service(isolated=True)
+        self.assertIsNot(first, second)
+        self.assertIsNone(drive._service_cache["service"])
 
 
 if __name__ == "__main__":
