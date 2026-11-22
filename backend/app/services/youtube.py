@@ -4,7 +4,7 @@ import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -23,6 +23,7 @@ from colab.youtube_lib import (
     build_catalog_payload,
     build_youtube_title,
     classify_playlist,
+    empty_state,
     load_state,
     parse_path_date,
     record_upload,
@@ -137,6 +138,8 @@ def _find_child_folder(parent_id: str, name: str) -> str | None:
 
 
 def ensure_meta_folder() -> str:
+    if settings.youtube_meta_folder_id.strip():
+        return settings.youtube_meta_folder_id.strip()
     drive = _drive()
     root = drive.get_folder_id()
     if not root:
@@ -171,13 +174,10 @@ def _download_json(folder_id: str, filename: str) -> dict | None:
 
 def _upload_json(folder_id: str, filename: str, payload: dict) -> str:
     drive = _drive()
-    with NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2)
-        path = Path(fh.name)
-    try:
+    with TemporaryDirectory() as tmp:
+        path = Path(tmp) / filename
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return drive.upload_file(path, folder_id, "application/json")
-    finally:
-        path.unlink(missing_ok=True)
 
 
 def catalog_item_from_lecture(lecture: Lecture, speaker: Speaker | None, summary: dict) -> dict:
@@ -217,6 +217,9 @@ def export_catalog(db: Session) -> tuple[int, str]:
     payload = build_catalog_payload(items)
     folder_id = ensure_meta_folder()
     file_id = _upload_json(folder_id, CATALOG_NAME, payload)
+    if _download_json(folder_id, STATE_NAME) is None:
+        _upload_json(folder_id, STATE_NAME, empty_state())
+        log.info("state.json inicial enviado (vazio) para %s", folder_id)
     log.info("catálogo YouTube enviado (%s itens) file_id=%s", len(items), file_id)
     return len(items), folder_id
 

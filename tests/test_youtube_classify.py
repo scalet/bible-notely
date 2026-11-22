@@ -66,6 +66,9 @@ class ClassifyTest(unittest.TestCase):
         self.assertIn("Gerson", text)
         self.assertIn("João 3:16", text)
         self.assertIn("Deus amou o mundo", text)
+        self.assertIn("Amor de Deus", text)
+        self.assertNotIn("• A\n• m", text)
+        self.assertIn("Conclusão\nAmor de Deus", text)
 
     def test_skip_without_study_title(self) -> None:
         row = yt.merge_video_row(
@@ -74,6 +77,74 @@ class ClassifyTest(unittest.TestCase):
             yt.empty_state(),
         )
         self.assertEqual(row["skip_reason"], "sem título do estudo")
+
+    def test_mounted_listing_and_scope(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            day = root / "2026" / "01-Janeiro" / "04-01"
+            day.mkdir(parents=True)
+            video = day / "20260104_090354.mp4"
+            video.write_bytes(b"x" * 100)
+            listed = yt.list_mounted_mp4s(root)
+            self.assertEqual(len(listed), 1)
+            self.assertEqual(listed[0]["path"], "2026/01-Janeiro/04-01")
+            self.assertEqual(listed[0]["local_path"], str(video))
+            self.assertEqual(len(yt.list_mounted_mp4s(root, "2025")), 0)
+            self.assertEqual(len(yt.list_mounted_mp4s(root, "2026/01-Janeiro")), 1)
+
+    def test_catalog_match_by_path(self) -> None:
+        catalog = {
+            "items": [
+                {
+                    "drive_file_id": "id-1",
+                    "drive_path": "2026/01-Janeiro/04-01",
+                    "video_filename": "20260104_090354.mp4",
+                    "titulo": "Tema da aula",
+                }
+            ]
+        }
+        index = yt.catalog_index(catalog)
+        row = yt.merge_video_row(
+            {
+                "id": "",
+                "name": "20260104_090354.mp4",
+                "path": "2026/01-Janeiro/04-01",
+                "size": 2_000_000_000,
+                "local_path": "",
+            },
+            index,
+            yt.empty_state(),
+        )
+        self.assertEqual(row["drive_file_id"], "id-1")
+        self.assertIn("Tema da aula", row["youtube_title"])
+
+    def test_missing_mounted_file(self) -> None:
+        row = yt.merge_video_row(
+            {
+                "id": "abc",
+                "name": "a.mp4",
+                "path": "2026/01-Janeiro/04-01",
+                "size": 2_000_000_000,
+                "local_path": "/tmp/does-not-exist-ebd.mp4",
+            },
+            {"abc": {"titulo": "Tema"}},
+            yt.empty_state(),
+        )
+        self.assertIn("não encontrado", row["skip_reason"])
+
+    def test_quota_error(self) -> None:
+        class Fake:
+            def __init__(self) -> None:
+                self.resp = type("R", (), {"status": 403})()
+                self.content = b'{"error":{"errors":[{"reason":"quotaExceeded"}]}}'
+
+            def __str__(self) -> str:
+                return "HttpError 403 quotaExceeded"
+
+        self.assertTrue(yt.is_youtube_quota_error(Fake()))
+        self.assertFalse(yt.is_youtube_quota_error(RuntimeError("arquivo sumiu")))
 
     def test_state_record(self) -> None:
         state = yt.empty_state()

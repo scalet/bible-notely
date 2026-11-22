@@ -417,6 +417,62 @@ class DownloadMd5Test(unittest.TestCase):
         self.assertFalse(dest.exists())
         dest.parent.rmdir()
 
+    def test_resumes_after_dropped_connection(self) -> None:
+        payload = b"aula-ebd"
+        dest = Path(tempfile.mkdtemp()) / "aula.mp4"
+        calls = {"n": 0}
+
+        class _Downloader:
+            def __init__(self, fh, *_args, **_kwargs) -> None:
+                self.fh = fh
+                self._progress = 0
+
+            def next_chunk(self, num_retries=0):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise AttributeError("'NoneType' object has no attribute 'read'")
+                self.fh.write(payload)
+                self._progress = len(payload)
+                return None, True
+
+        with (
+            mock.patch.object(drive, "_service", return_value=self._Service()),
+            mock.patch.object(drive, "google_account", return_value="conta"),
+            mock.patch.object(drive, "MediaIoBaseDownload", _Downloader),
+            mock.patch.object(drive.time, "sleep"),
+        ):
+            drive.download_file(
+                "id",
+                dest,
+                expected_size=len(payload),
+                expected_md5=hashlib.md5(payload).hexdigest(),
+            )
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(dest.read_bytes(), payload)
+        dest.unlink()
+        dest.parent.rmdir()
+
+    def test_gives_up_when_connection_keeps_dropping(self) -> None:
+        dest = Path(tempfile.mkdtemp()) / "aula.mp4"
+
+        class _Downloader:
+            def __init__(self, fh, *_args, **_kwargs) -> None:
+                self.fh = fh
+
+            def next_chunk(self, num_retries=0):
+                raise AttributeError("'NoneType' object has no attribute 'read'")
+
+        with (
+            mock.patch.object(drive, "_service", return_value=self._Service()),
+            mock.patch.object(drive, "google_account", return_value="conta"),
+            mock.patch.object(drive, "MediaIoBaseDownload", _Downloader),
+            mock.patch.object(drive.time, "sleep"),
+            self.assertRaises(drive.DriveTransient),
+        ):
+            drive.download_file("id", dest, expected_size=8)
+        dest.unlink(missing_ok=True)
+        dest.parent.rmdir()
+
 
 if __name__ == "__main__":
     unittest.main()

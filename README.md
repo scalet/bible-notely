@@ -165,13 +165,18 @@ PYTHONPATH="$PWD" .venv/bin/python -m backend.app.cli youtube-sync
 
 (`youtube-sync` lê `data/youtube/state.json` e, se existir, o `state.json` do Colab na pasta `auto-ebd-youtube` no Drive.)
 
-### Colab (volumes muito grandes / rede Google)
+### Colab (recomendado: o MP4 não baixa no seu PC)
 
-1. `cli youtube-catalog` — grava `auto-ebd-youtube/catalog.json` no Drive.
-2. [colab/upload_youtube.ipynb](colab/upload_youtube.ipynb) — upload no Colab.
-3. `cli youtube-sync` — importa URLs para o SQLite.
+O notebook lê o Drive **montado no Colab** (`/content/drive/MyDrive/...`) e envia à API do YouTube na VM do Google.
 
-Pré-requisitos: YouTube Data API v3 ativa, canal verificado para vídeos longos, mesmo `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` do Drive (escopos `youtube.upload` e `youtube` no login do `youtube-auth` ou no OAuth do Colab).
+1. Copie [colab/youtube_lib.py](colab/youtube_lib.py) e o `client_secret.json` (OAuth Desktop) para `Meu Drive/auto-ebd-youtube/`.
+2. `cli youtube-catalog` — grava `catalog.json` (pode ir na mesma pasta).
+3. Abra [colab/upload_youtube.ipynb](colab/upload_youtube.ipynb) no Colab. Ajuste `EBD_ROOT` para o caminho montado das aulas. Rode as células: pip → `drive.mount` → OAuth (token fica em `auto-ebd-youtube/token.json`) → preview → upload.
+4. `cli youtube-sync` — importa as URLs do `state.json` para o SQLite.
+
+Não use `youtube-upload` na máquina se não quiser baixar o vídeo localmente.
+
+Pré-requisitos: YouTube Data API v3, canal verificado para vídeos longos, escopos `youtube.upload` e `youtube`.
 
 ## Rotina diária
 
